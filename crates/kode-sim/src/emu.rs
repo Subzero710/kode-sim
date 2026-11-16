@@ -249,6 +249,10 @@ pub async fn launch(cfg: &Launch, on_line: Arc<dyn Fn(String) + Send + Sync>) ->
     let port = free_port().map_err(|e| e.to_string())?;
     let control = format!("127.0.0.1:{}", free_port().map_err(|e| e.to_string())?);
     let cosim = format!("127.0.0.1:{}", free_port().map_err(|e| e.to_string())?);
+    // An esp-emu that is not there says so before the C5 is built for it.
+    if !exe.is_file() {
+        return Err(format!("could not start {}: there is no such file", exe.display()));
+    }
     // The C5 first: the P4 connects to its socket as it boots.
     let c5 = if cfg.wifi { Some(start_c5(&exe, cfg).await?) } else { None };
     let sock = c5.as_ref().map(|c| c.scratch[0].clone());
