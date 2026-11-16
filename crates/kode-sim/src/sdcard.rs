@@ -186,7 +186,13 @@ mod tests {
         let ptype = d[446 + 4];
         let lba = u32::from_le_bytes(d[446 + 8..446 + 12].try_into().unwrap()) as usize;
         assert!(ptype == 0x0B || ptype == 0x0C, "{ptype:#x}");
-        assert_eq!(lba, 2048); // FAT32, where cards have it
+        if crate::emu::which("mformat") {
+            assert_eq!(lba, 2048); // FAT32, where cards have it
+        } else {
+            // diskutil puts it where its macOS does (sector 63 on recent ones);
+            // the firmware finds it in the MBR wherever it is.
+            assert!(lba >= 63, "{lba}");
+        }
         let boot = &d[lba * 512..(lba + 1) * 512];
         assert_eq!(&boot[82..90], b"FAT32   ");
         assert_eq!(&boot[71..82], b"KODEDOT    ");
