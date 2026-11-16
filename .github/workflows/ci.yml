@@ -24,7 +24,7 @@ jobs:
       matrix:
         # Linux on every pull request; the Mac, which kode-sim is made for,
         # too on main, tags and by hand (its minutes cost more).
-        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest","macos-14"]') }}
+        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest","macos-latest"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
