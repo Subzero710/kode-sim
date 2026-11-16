@@ -4,9 +4,78 @@ What changes from one kode-sim release to the next. The versions follow
 [SemVer](https://semver.org): until 1.0 a minor release (0.2, 0.3…) may
 change how kode-sim is used, and says so here.
 
-## [Unreleased]
+## [0.3.0] - 2026-11-16
+
+kode-sim moves to esp-emu 1.1.0, which models the Kode Dot's screen, its
+microSD and its ESP32-C5. The three leave kemu, and a binary built for the
+board runs unchanged: kodeOS's own release boots with its screen, its card,
+and its C5's WiFi and BLE.
+
+### Changed
+
+- **The screen is esp-emu's MIPI-DSI.** The firmware's own `esp_lcd` DSI
+  bus, DBI channel and DPI panel run; kode-sim is the panel on the link
+  (`--cosim-tcp`, virtual channel 0), takes the rows of each frame that
+  changed, and lights, dims and sleeps it from the DCS commands. kemu's
+  panel (`kemu_panel.c`) is gone.
+- **The microSD is esp-emu's SDMMC** (`--sd`, slot 0). The firmware's own
+  SDMMC host driver mounts the card image. esp-emu takes no card in or out
+  while it runs, so the page's "SD insertada" restarts the Kode Dot with the
+  slot changed. kemu's card (`kemu_sd.c`, `models/sdcard.c`) is gone.
+- **The ESP32-C5 is real.** kode-sim builds Kode's C5 firmware,
+  [kode_slave_c5](https://github.com/kodediy/kode_slave_c5) v0.1.2, once,
+  and runs it in a second esp-emu bridged to the P4's SDIO link
+  (`--hosted`). The radio is back in a build for the simulator: AO_Radio,
+  esp-hosted, the vault, scans, joins and BLE all run as on the board. The
+  Kode Dot sees one network, `kode-sim`, open, with the Mac's connection
+  behind it; `--forward` and `--no-internet` act on it. `--no-wifi` runs no
+  C5. kemu's radio and Ethernet (`kemu_radio.c`, `kemu_net.c`) are gone, and
+  so is the RADIO frame.
+- **The I2S word clock is left on its pad.** esp-emu 1.1.0 sends its edges
+  only to a consumer that watches GPIO 37, so `kemu_i2s.c` is gone.
+- **A board image's console works.** Without kemu, what the terminal, the
+  page and the serial port type goes to esp-emu's stdin, the firmware's
+  USB-Serial/JTAG; esp-emu follows only that console (`--console usb-jtag`),
+  not the CDC console a board image also opens on its USB-OTG port.
+
+- **The simulator joins its network for you, once.** The C5's vault starts
+  blank, as a new board's does: when the radio says its C5 knows no
+  network, kode-sim types `wifi_join ssid="kode-sim"` at the console, so an
+  app that asks for WiFi gets an address as before (one built without the
+  console does not, unless its C5 kept the network: `--save-state`).
+- **Breaking: an app built for the simulator with the radio off has no
+  radio.** kemu used to answer `radio_state_request()`, `wifi_start_request()`
+  and the rest in an app built with `CONFIG_KODEOS_RADIO=n`; those calls now
+  need the radio on, as on the board (kode-sdk's `examples/network` says how).
+- **The page's "SD insertada" restarts the Kode Dot**, as esp-emu changes no
+  slot while it runs: without `--save-state`, apps installed since it booted
+  go with it.
+
+### Known issue
+
+- **An app adopted from the mailbox loses the screen.** After kodeOS
+  adopts an app from app_pending (`kode-sim install --mailbox`, the page's
+  mailbox upload), esp-emu 1.1.0's DMA refuses the DSI frame buffer in PSRAM
+  ("DW_GDMA ch0: DsiTx block of 411640 bytes at 0x48...  is not in memory",
+  then "MIPI-DSI: frame underrun"), and kodeOS restarts its glass in a loop.
+  A plain reset and an install through the console are not affected. It is
+  to be reported to Espressif.
+
+### Added
+
+- `kode-sim run --firmware` boots a KodeOS release: its factory pack,
+  merged into one image (the guide's "Board images").
+- `$KODE_SIM_C5`: another C5 image to run (`merged-binary.bin` and
+  `kode_c5.elf`). `--save-state` keeps the C5's flash, and so the networks
+  it joined.
 
 ### Fixed
+
+- **A configuration change solves the dependencies again.** A component's
+  rules may ask a Kconfig option (kode-sdk's kdrv pulls `esp_cam_sensor` only
+  with `CONFIG_KODE_TEST_DOT`): when the sdkconfig is made again, the build
+  now drops the solved `dependencies.lock` and configures CMake again, rather
+  than failing on a header the old solution never fetched.
 
 - **The USB host takes nothing from a Kode Dot that restarted until its new
   boot raises its pull-up.** A sector of a read under way when the firmware
