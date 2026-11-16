@@ -1,4 +1,4 @@
-# buttons_led's own settings. Everything about the board - flash, PSRAM,
+# The radio app's own settings (buttons_led's, with the radio on). Everything about the board - flash, PSRAM,
 # cache, the console - arrives from kbsp's sdkconfig.board, which
 # CMakeLists.txt fetches and reads first. Do not copy any of it here.
 
@@ -16,19 +16,12 @@ CONFIG_KODEOS_CONSOLE=y
 # depends on it and goes with it.
 CONFIG_KODEOS_SCREENSHOT=n
 
-# This example reacts to a button and drives the LED. It wants no network,
-# and the radio is the most expensive thing it could bring up for nothing.
-CONFIG_KODEOS_RADIO=n
-
-# Turning AO_Radio off is not enough to keep esp-hosted out: kdrv depends on
-# esp_wifi_remote, whose presence makes ESP_HOSTED_ENABLED default to y, and
-# the component then installs a constructor that claims the SDMMC controller
-# before app_main. KODEOS_RADIO selects the symbol; Kconfig cannot express
-# "deselect", so a firmware that wants no radio says the opposite out loud.
-CONFIG_ESP_HOSTED_ENABLED=n
-
-# No radio, so no BLE host: the board file turns the NimBLE lines on.
-CONFIG_BT_ENABLED=n
+# The radio and WiFi, as kode-sdk's network example has them: AO_Radio brings
+# the C5 up over esp-hosted and joins the network (the simulator's C5 is an
+# esp-emu of its own); the sockets are lwIP's, below AO_Net.
+CONFIG_KODEOS_RADIO=y
+CONFIG_KODEOS_WIFI=y
+CONFIG_KODEOS_NET=y
 
 # The SDK's own log lines are compiled in at every level, and most of them are
 # INFO: a shipped app that will never print them can compile them away, which

@@ -12,11 +12,6 @@ target_compile_options(test_frame PRIVATE -Wall -Wextra -Werror)
 add_test(NAME frame COMMAND test_frame)
 
 
-add_executable(test_sdcard test_sdcard.c ${KEMU}/models/sdcard.c)
-target_include_directories(test_sdcard PRIVATE ${KEMU}/models)
-target_compile_options(test_sdcard PRIVATE -Wall -Wextra -Werror)
-add_test(NAME sdcard COMMAND test_sdcard)
-
 add_executable(test_usbdcd test_usbdcd.c ${KEMU}/models/usbdcd.c)
 target_include_directories(test_usbdcd PRIVATE ${KEMU}/models)
 target_compile_options(test_usbdcd PRIVATE -Wall -Wextra -Werror)

@@ -68,14 +68,14 @@ static void payload_split_across_feeds(void)
     const uint8_t c[5] = {'K', 'D', 'K', 'D', 0};
     size_t n = 0;
     reset();
-    n += frame(f + n, KEMU_T_SD_DATA, a, sizeof a);
+    n += frame(f + n, KEMU_T_USB_OUT, a, sizeof a);
     n += frame(f + n, KEMU_T_LED, b, sizeof b);
     n += frame(f + n, KEMU_T_TOUCH, c, sizeof c);
     CHECK(kemu_dec_feed(&dec, f, 12, on_frame, NULL) == 0);          /* 5 bytes into a */
     CHECK(kemu_dec_feed(&dec, f + 12, n - 12 - 3, on_frame, NULL) == 2);
     CHECK(kemu_dec_feed(&dec, f + n - 3, 3, on_frame, NULL) == 1);   /* c's tail */
     CHECK(got_n == 3);
-    CHECK(got_type[0] == KEMU_T_SD_DATA && got_len[0] == 12 && memcmp(got_payload[0], a, 12) == 0);
+    CHECK(got_type[0] == KEMU_T_USB_OUT && got_len[0] == 12 && memcmp(got_payload[0], a, 12) == 0);
     CHECK(got_type[1] == KEMU_T_LED && got_len[1] == 2 && memcmp(got_payload[1], b, 2) == 0);
     CHECK(got_type[2] == KEMU_T_TOUCH && got_len[2] == 5 && memcmp(got_payload[2], c, 5) == 0);
 }
@@ -90,8 +90,8 @@ static void payload_fills_the_buffer(void)
     for (size_t i = 0; i < sizeof p; i++) {
         p[i] = (uint8_t)(i * 7U);
     }
-    n += frame(f + n, KEMU_T_SD_DATA, p, sizeof p);
-    n += frame(f + n, KEMU_T_SD_DATA, p, sizeof p);
+    n += frame(f + n, KEMU_T_USB_OUT, p, sizeof p);
+    n += frame(f + n, KEMU_T_USB_OUT, p, sizeof p);
     CHECK(kemu_dec_feed(&dec, f, n, on_frame, NULL) == 2);
     CHECK(got_n == 2 && got_len[1] == sizeof p && memcmp(got_payload[1], p, 16) == 0);
     CHECK(memcmp(dec_buf + KEMU_FRAME_HEADER, p, sizeof p) == 0);

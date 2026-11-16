@@ -682,9 +682,10 @@ async fn review_in(
             forwards: vec![],
             restrict: s.network == "none",
             save_state: false,
+            sd: None,
+            wifi: s.wifi,
         },
         http_port: 0,
-        wifi: s.wifi,
         sd: card,
         sd_in: true,
     });

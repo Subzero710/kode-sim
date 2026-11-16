@@ -10,9 +10,11 @@
 mod audio;
 mod bridge;
 mod build;
+mod c5;
 mod chips;
 mod emu;
 mod install;
+mod panel;
 mod proto;
 mod review;
 mod run;

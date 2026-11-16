@@ -1,21 +1,11 @@
 # What the simulator changes about a Kode Dot build, applied last.
 #
-# No C5 in v1: the radio and esp-hosted stay out. esp-hosted has to be said
-# out loud - kdrv pulling esp_wifi_remote makes it default to y, and its
-# constructor would claim the SDMMC controller before app_main.
-CONFIG_KODEOS_RADIO=n
-CONFIG_ESP_HOSTED_ENABLED=n
-
-# kodeOS's link rest takes the DSI link down and, on the wake, reads the
-# panel back through raw DSI packets (mipi_dsi_host_ll_gen_*): a controller
-# the emulator does not have. The rest itself stays - the glass dims, goes
-# dark, and DISPOFF/SLPIN reach kemu's panel - only the link stays up, and
-# light sleep, which depends on it, goes with it. An SDK without the option
-# ignores the line.
+# Since esp-emu 1.1.0 the radio, the card and the panel are the board's own
+# (the C5 runs in an esp-emu of its own), so almost nothing is left here.
+#
+# An older kode-sdk's link rest takes the DSI link down and, on the wake,
+# reads the panel back through raw DSI packets; esp-emu answers a panel read
+# with zeros. Only the link stays up; the rest itself - the glass dims, goes
+# dark, DISPOFF/SLPIN - is as on the board. An SDK without the option (any
+# from 0.1.1 on) ignores the line.
 CONFIG_KODEOS_DISPLAY_SLEEP_LINK=n
-
-
-# The factory's final test (AO_TestDot, driven by the E5 station over the
-# cable) needs the radio, which the simulator leaves out: KodeOS turns it on
-# in its defaults, and its #error would stop the build.
-CONFIG_KODE_TEST_DOT=n
