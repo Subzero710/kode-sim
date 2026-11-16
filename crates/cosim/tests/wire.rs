@@ -97,3 +97,26 @@ fn an_i2s_format_and_the_samples_played_are_read_back() {
     let m = decode(&raw("0809f201060a0410002000")).unwrap();
     assert_eq!((m.sim_time_ns, m.payload), (9, Payload::I2sOut(vec![0x10, 0, 0x20, 0])));
 }
+
+// The MIPI-DSI panel, byte for byte as esp-emulator's tools/cosim_tcp.py
+// (1.1.0) encodes the claim and decodes the events.
+
+#[test]
+fn a_dsi_claim_names_the_virtual_channel() {
+    assert_eq!(hex(&register("kodedot", &[Claim::Dsi { vc: 0 }])), "2212080112076b6f6465646f741a05a201020800");
+}
+
+#[test]
+fn a_dsi_command_a_format_and_rows_are_read_back() {
+    let raw =
+        |h: &str| (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect::<Vec<_>>();
+    let m = decode(&raw("0805a202080a060815120251ff")).unwrap();
+    assert_eq!((m.sim_time_ns, m.payload), (5, Payload::Dsi(Dsi::Command { dt: 0x15, data: vec![0x51, 0xff] })));
+    let m = decode(&raw("0806a2020c120a0801109a0318f6032001")).unwrap();
+    assert_eq!(
+        m.payload,
+        Payload::Dsi(Dsi::Format { streaming: true, width: 410, height: 502, pixels: DpiPixels::Rgb565 })
+    );
+    let m = decode(&raw("0807a2020e1a0c080210071801220401020304")).unwrap();
+    assert_eq!(m.payload, Payload::Dsi(Dsi::Rows { frame: 2, y: 7, rows: 1, pixels: vec![1, 2, 3, 4] }));
+}

@@ -25,6 +25,10 @@ async def _console_says(w, text, timeout=5):
     return await next_json(w, lambda j: j.get("console") == text, timeout)
 
 
+async def _console_starts(w, text, timeout=5):
+    return await next_json(w, lambda j: str(j.get("console", "")).startswith(text), timeout)
+
+
 async def _past_history(w):
     """Past the console a page is sent on connecting: what follows is new."""
     await w.send_str(json.dumps({"console_in": "now"}))
@@ -468,7 +472,7 @@ async def test_a_boot_clears_the_screen_on_every_page(sim):
 async def _booted_again(a, after):
     """The firmware's next boot, as the bridge saw it: its HELLO answered."""
     await _console_says(a, after)
-    await _console_says(a, f"rx {kd.RADIO} 1 01")
+    await _console_starts(a, f"rx {kd.TIME} 8 ")
 
 
 async def test_a_reset_that_cuts_a_frame_short_does_not_hide_the_next_boot(sim):
@@ -649,6 +653,11 @@ async def test_sigterm_stops_a_review_and_its_emulator(exe, fake_emu, tmp_path, 
 
 # ---- esp-emu's command line ---------------------------------------------------------
 
+def _c5_args(fake_emu):
+    """The C5's esp-emu's arguments, its last launch's."""
+    return (fake_emu.parent / (fake_emu.name + ".c5")).read_text().splitlines()[-1].split()
+
+
 async def test_esp_emu_runs_as_a_kode_dot(sim, fake_emu, tmp_path):
     args = fake_emu.read_text().split()
     assert args[:2] == ["--chip", "esp32p4"]
@@ -657,18 +666,27 @@ async def test_esp_emu_runs_as_a_kode_dot(sim, fake_emu, tmp_path):
     assert args[args.index("--psram-size") + 1] == "32M"
     for flag in ("--uart1-tcp", "--control-tcp", "--cosim-tcp"):
         assert args[args.index(flag) + 1].startswith("127.0.0.1:"), flag
-    assert args[args.index("--net") + 1] == "user"
-    assert "--save-state" not in args
+    assert args[args.index("--sd") + 1] == f"{tmp_path / 'card.img'},slot=0"
+    assert args[args.index("--hosted-reset-gpio") + 1] == "23"
+    assert "--net" not in args and "--save-state" not in args
+    # The C5 beside it, on the other end of the SDIO socket, with the network.
+    c5 = _c5_args(fake_emu)
+    assert c5[:2] == ["--chip", "esp32c5"]
+    sock = args[args.index("--hosted") + 1].removeprefix("bridge:host:")
+    assert c5[c5.index("--hosted") + 1] == f"bridge:slave:{sock}"
+    assert c5[c5.index("--net") + 1] == "user"
+    assert c5[c5.index("--wifi-ssid") + 1] == "kode-sim"
 
 
 async def test_forwarded_ports_reach_esp_emu_as_hostfwd(exe, fake_emu, tmp_path):
     """`kode-sim run --forward 25565 --forward 8080:80`: the Mac's localhost
-    ports into the Kode Dot's, through esp-emu's user-mode network."""
+    ports into the Kode Dot's, through the user-mode network of the C5's
+    esp-emu, whose WiFi the Kode Dot is on."""
     sim = await start(exe, tmp_path, "--forward", "25565", "--forward", "8080:80")
     try:
-        args = fake_emu.read_text().split()
-        assert args[args.index("--net") + 1] == \
-            "user,hostfwd=tcp:127.0.0.1:25565-:25565,hostfwd=tcp:127.0.0.1:8080-:80", args
+        c5 = _c5_args(fake_emu)
+        assert c5[c5.index("--net") + 1] == \
+            "user,hostfwd=tcp:127.0.0.1:25565-:25565,hostfwd=tcp:127.0.0.1:8080-:80", c5
         assert "127.0.0.1:8080 on this Mac reaches the Kode Dot's port 80" in sim.stderr()
     finally:
         sim.stop()
@@ -681,15 +699,34 @@ async def test_a_bad_forward_is_refused(exe, tmp_path):
         assert r.returncode == 2 and "PORT" in r.stderr, (bad, r.stderr)
 
 
-async def test_the_firmware_is_told_whether_its_c5_is_alive(exe, fake_emu, tmp_path):
-    """After every HELLO the bridge says whether the radio works: alive by
-    default, dead with `--no-wifi` - as the board's C5 would or would not."""
-    for args, said in (((), "rx 133 1 01"), (("--no-wifi",), "rx 133 1 00")):
+async def test_the_c5_comes_up_unless_it_is_dead(exe, fake_emu, tmp_path):
+    """The C5's esp-emu beside the P4's by default; with `--no-wifi` none,
+    and the P4's SDIO link finds no card - as on a board whose C5 is dead."""
+    c5_log = fake_emu.parent / (fake_emu.name + ".c5")
+    for args, alive in (((), True), (("--no-wifi",), False)):
+        c5_log.unlink(missing_ok=True)
         sim = await start(exe, tmp_path, *args)
         try:
-            await sim.said(said)
+            await sim.said(f"rx {kd.TIME} 8 ")
+            p4 = fake_emu.read_text().splitlines()[-1].split()
+            assert ("--hosted" in p4) == alive, p4
+            assert c5_log.exists() == alive
         finally:
             sim.stop()
+
+
+async def test_a_board_image_s_console_is_esp_emu_s_stdin(exe, fake_emu, tmp_path, monkeypatch):
+    """A firmware built for the board has no kemu, so it never says HELLO:
+    what the page types reaches its USB-Serial/JTAG, esp-emu's stdin."""
+    monkeypatch.setenv("FAKE_BOARD_IMAGE", "1")
+    sim = await start(exe, tmp_path)
+    try:
+        a = await ws(sim)
+        await a.send_str(json.dumps({"console_in": "help"}))
+        await _console_says(a, "stdin: help", timeout=10)
+        await close(a)
+    finally:
+        sim.stop()
 
 
 async def test_after_every_hello_the_firmware_is_told_the_time(sim):
@@ -776,7 +813,7 @@ async def test_a_mailbox_esp_emu_could_not_write_is_not_reset_into(exe, fake_emu
     sim = await start(exe, tmp_path)
     resets = lambda: sum("fake: reset" in l for l in sim.printed())     # noqa: E731
     try:
-        await sim.said(f"rx {kd.RADIO} 1 01")                # booted, its launch's reset done
+        await sim.said(f"rx {kd.TIME} 8 ")                   # booted, its launch's reset done
         before = resets()
         async with aiohttp.ClientSession() as s:
             r = await s.post(f"{sim.url}api/mailbox", data=b"\xe9" + bytes(5000))
@@ -859,26 +896,39 @@ async def test_an_upload_to_a_kode_dot_that_is_off_is_refused(sim):
 
 # ---- the microSD --------------------------------------------------------------------------
 
-async def test_the_card_is_announced_after_hello_and_follows_the_page_s_switch(sim):
-    """After HELLO the firmware hears the card in the slot (its size in
-    sectors), and the page's "SD insertada" takes it out and puts it back."""
-    sectors = (8 * 1024 * 1024 // 512).to_bytes(4, "little").hex()
-    await sim.said(f"rx {kd.SD_CARD} 4 {sectors}")
+def _sd_of(fake_emu):
+    """The --sd of esp-emu's last launch, None for an empty slot."""
+    args = fake_emu.read_text().splitlines()[-1].split()
+    return args[args.index("--sd") + 1] if "--sd" in args else None
+
+
+async def test_the_card_is_in_the_slot_and_the_page_s_switch_restarts_with_it(sim, fake_emu, tmp_path):
+    """The card is esp-emu's (--sd, SDMMC slot 0). esp-emu changes no slot
+    while it runs, so the page's "SD insertada" restarts the Kode Dot with
+    the card out, then in, and every page hears the switch."""
+    card = f"{tmp_path / 'card.img'},slot=0"
+    assert _sd_of(fake_emu) == card
     a = await ws(sim)
     await next_json(a, lambda j: j.get("sd") is True)
-    for sd, said in ((False, "00000000"), (True, sectors)):
+    for sd, want in ((False, None), (True, card)):
+        launches = len(fake_emu.read_text().splitlines())
         await a.send_str(json.dumps({"sd": sd}))
-        seen: set = set()                               # every page hears the switch; the firmware, the card
-        await next_json(a, lambda j: seen.update(
-            [("sd", j["sd"])] if "sd" in j else [("console", j.get("console"))])
-            or {("sd", sd), ("console", f"rx {kd.SD_CARD} 4 {said}")} <= seen)
+        await next_json(a, lambda j: j.get("sd") is sd)
+        await _console_starts(a, "[kode-sim] the card ", timeout=10)
+        for _ in range(100):
+            if len(fake_emu.read_text().splitlines()) > launches:
+                break
+            await asyncio.sleep(0.1)
+        assert _sd_of(fake_emu) == want
+        await _console_starts(a, f"rx {kd.TIME} 8 ", timeout=15)
     await close(a)
 
 
 async def test_no_sd_starts_with_the_slot_empty(exe, fake_emu, tmp_path):
     sim = await start(exe, tmp_path, "--no-sd")
     try:
-        await sim.said(f"rx {kd.SD_CARD} 4 00000000")
+        await sim.said(f"rx {kd.TIME} 8 ")
+        assert _sd_of(fake_emu) is None
         a = await ws(sim)
         await next_json(a, lambda j: j.get("sd") is False)
         await close(a)
@@ -899,16 +949,6 @@ async def test_a_card_that_is_not_there_is_made(exe, fake_emu, tmp_path):
         sim.stop()
 
 
-async def test_a_write_the_card_does_not_take_is_said_on_the_console(sim):
-    """SD_WRITE has no answer: a write the image refused (past its end
-    here, a full disk or a vanished file elsewhere) is a console line."""
-    a = await ws(sim)
-    await a.send_str(json.dumps({"console_in": f"sdwrite {16384 - 1} 2 1"}))
-    j = await next_json(a, lambda j: str(j.get("console", "")).startswith("[kode-sim] "))
-    assert "16383" in j["console"] and "past the card's end" in j["console"], j
-    await close(a)
-
-
 async def test_a_card_in_one_simulator_is_not_put_in_another(sim, exe, tmp_path):
     """Two simulators on one card image would each write its FAT over the
     other's: the second says whose card it is and how to give it its own."""
@@ -924,29 +964,6 @@ async def test_a_card_in_one_simulator_is_not_put_in_another(sim, exe, tmp_path)
     await close(a)
 
 
-async def test_the_firmware_reads_and_writes_the_card_image(sim, tmp_path):
-    """SD_WRITE lands in the image file; SD_READ comes back as SD_DATA, in
-    frames kemu's 8 KB link buffer takes (15 blocks at most), each with the
-    read's tag - kemu takes no answer to a read it has given up on."""
-    img = tmp_path / "card.img"
-    a = await ws(sim)
-    await a.send_str(json.dumps({"console_in": "sdwrite 100 2 171"}))
-    await _console_says(a, "sdwritten")
-    await asyncio.sleep(0.2)
-    assert img.read_bytes()[100 * 512:102 * 512] == b"\xab" * 1024
-    await a.send_str(json.dumps({"console_in": "sdread 100 2 513"}))
-    await _console_says(a, f"sddata 100 2 {zlib.crc32(b'\xab' * 1024)} tag 513")
-    await a.send_str(json.dumps({"console_in": "sdread 0 40 9"}))      # 15 + 15 + 10
-    seen: list[str] = []
-    await next_json(a, lambda j: seen.append(j.get("console", "")) or seen[-1].startswith("sddata 30 10 "))
-    assert seen[-1].endswith(" tag 9"), seen[-1]
-    assert any(l.startswith("sddata 0 15 ") and l.endswith(" tag 9") for l in seen)
-    assert any(l.startswith("sddata 15 15 ") and l.endswith(" tag 9") for l in seen)
-    await a.send_str(json.dumps({"console_in": f"sdread {16384 - 1} 2 65535"}))   # past the card's end
-    await _console_says(a, f"sddata {16384 - 1} 0 0 tag 65535")
-    await close(a)
-
-
 # ---- what the tests of the firmware ask of it ------------------------------------------------
 
 async def test_no_internet_lets_nothing_out_but_dns(exe, fake_emu, tmp_path):
@@ -954,8 +971,8 @@ async def test_no_internet_lets_nothing_out_but_dns(exe, fake_emu, tmp_path):
     out, as a review's ("network": "none") - its clock has to come from its RTC."""
     sim = await start(exe, tmp_path, "--no-internet", "--forward", "8080:80")
     try:
-        args = fake_emu.read_text().split()
-        assert args[args.index("--net") + 1] == "user,restrict=yes,hostfwd=tcp:127.0.0.1:8080-:80", args
+        c5 = _c5_args(fake_emu)
+        assert c5[c5.index("--net") + 1] == "user,restrict=yes,hostfwd=tcp:127.0.0.1:8080-:80", c5
     finally:
         sim.stop()
 

@@ -229,18 +229,25 @@ async def test_the_way_home_keeps_the_glass_lit(exe, kodeos, display_lvgl, tmp_p
         await k.stop()
 
 
+async def join_kode_sim(k):
+    """The C5 up, join the one network it sees, as a person would once: the
+    vault of a C5 that starts blank holds none."""
+    await console_line(k, r"radio radio link=2\b", 90)
+    await k.console_in('wifi_join ssid="kode-sim"')
+
+
 async def test_an_app_gets_an_address_and_its_server_is_reachable_from_the_mac(exe, radio, tmp_path):
-    """WiFi in the simulator: the P4's own (emulated) Ethernet behind the
-    radio's signals. The app asks for WiFi and hears what a board on a
-    network says - RADIO_STATE_SIG UP (2), WIFI_STATE_SIG GOT_IP (2) with its
-    address - and a TCP server it opens is reached from the Mac through the
-    port `kode-sim run --forward` opens."""
+    """WiFi in the simulator: the C5 (Kode's firmware, in an esp-emu of its
+    own) over ESP-Hosted, on esp-emu's soft AP. The app asks for WiFi and
+    hears what a board on a network says - RADIO_STATE_SIG UP (2),
+    WIFI_STATE_SIG GOT_IP (2) with its address - and a TCP server it opens is
+    reached from the Mac through the port `kode-sim run --forward` opens."""
     port = kd.free_port()
     k = await boot(exe, tmp_path, radio, "--forward", f"{port}:7777")
     try:
         await frame_where(k, lambda t, p: t == kd.HELLO, 30)
-        await console_line(k, r"radio radio link=2\b", 60)
-        await console_line(k, r"radio wifi state=2 ip=192\.168\.4\.\d+ enabled=1", 20)
+        await join_kode_sim(k)
+        await console_line(k, r"radio wifi state=2 ip=192\.168\.4\.\d+ enabled=1", 30)
         await console_line(k, r"radio echo listening on 7777", 20)
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         writer.write(b"hola kode\n")
@@ -253,13 +260,14 @@ async def test_an_app_gets_an_address_and_its_server_is_reachable_from_the_mac(e
 
 
 async def test_with_the_network_up_the_top_button_still_works(exe, radio, tmp_path):
-    """TOP is a P4 pin (GPIO35) the board's chips drive. The emulated EMAC
-    kemu brings up for WiFi takes fixed RMII pins, none of which may be it:
-    its pad stays a GPIO input (IO_MUX function 1, PIN_FUNC_GPIO), and an app
-    with its network up still hears TOP pressed and released."""
+    """TOP is a P4 pin (GPIO35) the board's chips drive. The network takes
+    the SDIO pads and none of the others: TOP's pad stays a GPIO input
+    (IO_MUX function 1, PIN_FUNC_GPIO), and an app with its network up still
+    hears TOP pressed and released."""
     k = await boot(exe, tmp_path, radio)
     try:
-        await console_line(k, r"radio wifi state=2 ip=192\.168\.4\.\d+", 60)
+        await join_kode_sim(k)
+        await console_line(k, r"radio wifi state=2 ip=192\.168\.4\.\d+", 30)
         pad = await console_line(k, r"radio top pad fun_sel=", 10)
         assert "fun_sel=1 ie=1 oe=0" in pad, pad
         await asyncio.sleep(1)
@@ -286,10 +294,9 @@ async def test_with_the_c5_dead_an_app_hears_the_radio_failed(exe, radio, tmp_pa
 
 
 async def test_kodeos_mounts_the_card_image_and_a_file_lands_in_it(exe, kodeos, tmp_path):
-    """The microSD: kemu answers ESP-IDF's SDMMC host with a card whose blocks
-    are a card image on the Mac (`kode-sim run --sd`, made as a Mac formats
-    a card). kodeOS mounts it as it would a card, and a file put on /sdcard
-    is in the image afterwards."""
+    """The microSD: esp-emu's SDMMC host with a card image on the Mac in slot
+    0 (`kode-sim run --sd`, made as a Mac formats a card). kodeOS mounts it
+    as it would a card, and a file put on /sdcard is in the image afterwards."""
     img = tmp_path / "sd" / "card.img"
     k = await boot(exe, tmp_path, kodeos, "--sd", str(img))
     _, until = heard_from(k)
@@ -308,7 +315,7 @@ async def test_kodeos_mounts_the_card_image_and_a_file_lands_in_it(exe, kodeos, 
 async def test_an_app_that_waits_for_the_radio_finds_its_card_mounted(exe, radio, tmp_path):
     """On the board AO_Radio has AO_Storage mount the card around the link's
     lifetime, so an app that asks about the card once the radio has settled
-    (KodeCraft does) finds it mounted. kemu's radio asks the same."""
+    (KodeCraft does) finds it mounted."""
     k = await boot(exe, tmp_path, radio, "--sd", str(tmp_path / "sd" / "card.img"))
     try:
         line = await console_line(k, r"radio sd mounted=", 60)

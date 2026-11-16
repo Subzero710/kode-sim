@@ -295,17 +295,23 @@ pub fn prepare(cache: &Path, project: &Path, sdk: Option<&Path>, board: bool) ->
             write_if_changed(&seen, &theirs)?;
         }
     }
-    // Solved against another kode-sdk than this one: solved again, from the
+    // Solved against another kode-sdk than this one, or another
+    // configuration (a dependency's rules may ask a Kconfig option, as
+    // kdrv's esp_cam_sensor asks KODE_TEST_DOT): solved again, from the
     // project's own lock when it has one.
-    let deps = deps_stamp(sdk.as_deref());
-    let deps_file = work.join(DEPS_STAMP);
-    if std::fs::read_to_string(&deps_file).ok().as_deref() != Some(deps.as_str()) {
+    let resolve = || -> Result<(), BuildError> {
         match std::fs::read(&lock) {
             Ok(theirs) => write_if_changed(&src.join("dependencies.lock"), &theirs)?,
             Err(_) => {
                 let _ = std::fs::remove_file(src.join("dependencies.lock"));
             }
         }
+        Ok(())
+    };
+    let deps = deps_stamp(sdk.as_deref());
+    let deps_file = work.join(DEPS_STAMP);
+    if std::fs::read_to_string(&deps_file).ok().as_deref() != Some(deps.as_str()) {
+        resolve()?;
         write(&deps_file, &deps)?;
     }
     let stamp = config_stamp(&src, sdk.as_deref(), board);
@@ -314,6 +320,10 @@ pub fn prepare(cache: &Path, project: &Path, sdk: Option<&Path>, board: bool) ->
         for stale in ["sdkconfig", "sdkconfig.old"] {
             let _ = std::fs::remove_file(src.join(stale));
         }
+        // The component manager weighs those rules as CMake configures:
+        // configured again, not only rebuilt.
+        resolve()?;
+        let _ = std::fs::remove_file(work.join("out").join("CMakeCache.txt"));
         write(&stamp_file, &stamp)?;
     }
     Ok(src)
@@ -330,7 +340,7 @@ fn anchored(p: &str) -> String {
 
 /// `idf.py ARGS` in the ESP-IDF environment `script` sets up, its output
 /// into `log` - the script's too, when it fails.
-fn idf(script: &Path, args: &[String], log: &Path, append: bool) -> Result<bool, BuildError> {
+pub(crate) fn idf(script: &Path, args: &[String], log: &Path, append: bool) -> Result<bool, BuildError> {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -852,6 +862,32 @@ endif()
         assert_eq!(fs::read_to_string(src.join("dependencies.lock")).unwrap(), "solved\n");
         assert!(fs::read_to_string(src.join("CMakeLists.txt")).unwrap().contains("kode_sim.cmake"));
         assert!(fs::read_to_string(src.join("main/idf_component.yml")).unwrap().contains("override_path: /sdk"));
+    }
+
+    #[test]
+    fn a_new_configuration_is_solved_and_configured_again() {
+        if !rsync_ok() {
+            return;
+        }
+        // A component's rules may ask a Kconfig option: once the sdkconfig
+        // is made again, so are the solved dependencies and CMake's cache.
+        let t = Tmp::new("prepare");
+        let cache = t.0.join("cache");
+        let proj = t.0.join("app");
+        fs::create_dir_all(proj.join("main")).unwrap();
+        fs::write(proj.join("CMakeLists.txt"), BUTTONS_LED).unwrap();
+        fs::write(proj.join("sdkconfig.defaults"), "CONFIG_KODE_TEST_DOT=n\n").unwrap();
+        let src = prepare(&cache, &proj, None, false).unwrap();
+        let out = work_dir(&cache, &proj, false).join("out");
+        fs::create_dir_all(&out).unwrap();
+        fs::write(src.join("dependencies.lock"), "solved without the camera\n").unwrap();
+        fs::write(out.join("CMakeCache.txt"), "configured\n").unwrap();
+        prepare(&cache, &proj, None, false).unwrap();
+        assert!(src.join("dependencies.lock").exists() && out.join("CMakeCache.txt").exists(), "nothing changed");
+        fs::write(proj.join("sdkconfig.defaults"), "CONFIG_KODE_TEST_DOT=y\n").unwrap();
+        prepare(&cache, &proj, None, false).unwrap();
+        assert!(!src.join("dependencies.lock").exists(), "solved for the old configuration");
+        assert!(!out.join("CMakeCache.txt").exists(), "configured for the old configuration");
     }
 
     #[test]

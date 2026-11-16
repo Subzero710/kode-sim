@@ -239,8 +239,6 @@ impl PageQueue {
 pub struct Config {
     pub launch: Launch,
     pub http_port: u16,
-    /// Does the C5 come up?
-    pub wifi: bool,
     /// The card image, if there is a card.
     pub sd: Option<PathBuf>,
     /// Is it in the slot (the page's "SD insertada")?
@@ -336,14 +334,13 @@ impl State {
         out
     }
 
-    fn send_card(&self) {
-        if let Some(emu) = &self.emu {
-            let sectors = match (&self.card, self.sd_in) {
-                (Some(c), true) => c.sectors as u32,
-                _ => 0,
-            };
-            emu.send(proto::SD_CARD, &sectors.to_le_bytes());
-        }
+    /// The screen black and the panel unlit, on the pages already here too:
+    /// a board coming up.
+    fn dark(&mut self) {
+        self.fb.fill(0);
+        self.panel = Some(vec![0; 2]);
+        self.broadcast(self.screen());
+        self.broadcast(Msg::Bin(proto::encode(proto::PANEL, &[0; 2]).into()));
     }
 
     fn send_battery(&self) {
@@ -351,50 +348,6 @@ impl State {
             emu.input(Input::Battery(self.battery));
             emu.input(Input::Motion(self.motion));
         }
-    }
-
-    /// The card's blocks: the firmware's business, not the page's. What
-    /// went wrong, for the console: SD_WRITE has no answer, so a write the
-    /// image refused is said there and nowhere else. The card stays in -
-    /// kemu has already been told the write went in, and a card pulled
-    /// mid-write would cost the whole filesystem, not those blocks.
-    fn card_io(&self, t: u8, p: &[u8]) -> Option<String> {
-        let emu = self.emu.as_ref()?;
-        if p.len() < 6 {
-            return None;
-        }
-        let lba = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
-        let count = u16::from_le_bytes([p[4], p[5]]) as usize;
-        let card = self.card.as_ref().filter(|_| self.sd_in);
-        if t == proto::SD_WRITE {
-            let c = card?;
-            return c
-                .write(lba as u64, &p[6..])
-                .err()
-                .map(|e| format!("the card did not take a write at block {lba}: {e}"));
-        }
-        // A read without its tag is not one kemu sent: nothing would take
-        // the answer.
-        let tag = p.get(6..proto::SD_HEAD)?;
-        let data = card.map(|c| c.read(lba as u64, count as u64)).unwrap_or_default();
-        let head = |lba: u32, n: usize| {
-            let mut h = lba.to_le_bytes().to_vec();
-            h.extend_from_slice(&(n as u16).to_le_bytes());
-            h.extend_from_slice(tag);
-            h
-        };
-        if data.is_empty() {
-            // No card, or past its end: a read that fails.
-            emu.send(proto::SD_DATA, &head(lba, 0));
-            return None;
-        }
-        for at in (0..count).step_by(proto::SD_DATA_MAX) {
-            let n = proto::SD_DATA_MAX.min(count - at);
-            let mut f = head(lba + at as u32, n);
-            f.extend_from_slice(&data[at * proto::SD_BLOCK..(at + n) * proto::SD_BLOCK]);
-            emu.send(proto::SD_DATA, &f);
-        }
-        None
     }
 
     fn apply(&mut self, p: &[u8]) {
@@ -412,6 +365,12 @@ impl State {
             self.fb[dst..dst + w * 2].copy_from_slice(&body[row * w * 2..(row + 1) * w * 2]);
         }
     }
+}
+
+/// Is this the radio saying its C5 came up with no network in its vault
+/// (kode-sdk's AO_Radio: "kaos.radio C5: KODE services v3, 0 networks, ...")?
+fn first_join(line: &str) -> bool {
+    line.contains("kaos.radio C5: KODE services") && line.contains(" 0 networks,")
 }
 
 /// What the terminal does with each console line.
@@ -526,11 +485,15 @@ impl Bridge {
             st.powering_off = false;
             st.recent.clear();
         }
+        // The card in the slot is the one there at power-on: esp-emu takes
+        // no card in or out while it runs.
+        let mut launch = self.cfg.launch.clone();
+        launch.sd = self.cfg.sd.clone().filter(|_| self.lock().sd_in);
         let me = self.clone();
         // A launch given up half-way stops what it started (emu::launch).
         let mut closing = self.closing.subscribe();
         let (emu, wiring) = tokio::select! {
-            launched = emu::launch(&self.cfg.launch, Arc::new(move |l| me.line(&l))) => launched?,
+            launched = emu::launch(&launch, Arc::new(move |l| me.line(&l))) => launched?,
             _ = closing.wait_for(|c| *c) => return Err("kode-sim is stopping".into()),
         };
         self.lock().emu = Some(emu.clone());
@@ -621,6 +584,11 @@ impl Bridge {
                         me.mic_rate(rate);
                         continue;
                     }
+                    Out::Screen(shown) => crate::panel::frame(&shown),
+                    Out::Reset => {
+                        emu.kemu_gone();
+                        continue;
+                    }
                 };
                 me.from_firmware(frame.0, frame.1);
             }
@@ -670,14 +638,6 @@ impl Bridge {
         }
         let mut st = self.lock();
         match t {
-            proto::SD_READ | proto::SD_WRITE => {
-                let wrong = st.card_io(t, &p);
-                drop(st);
-                if let Some(w) = wrong {
-                    self.line(&format!("[kode-sim] {w}"));
-                }
-                return;
-            }
             proto::HELLO => {
                 if let Some(u) = self.usb.get() {
                     u.rebooted();
@@ -686,20 +646,16 @@ impl Bridge {
                 // and the LED start dark, as the board's do while it comes
                 // up - on the pages already here too. The Mac's microphone
                 // is the page's: it stays as it was.
-                st.fb.fill(0);
+                st.dark();
                 st.led = Some(vec![0; 3]);
-                st.panel = Some(vec![0; 2]);
-                st.broadcast(st.screen());
                 st.broadcast(Msg::Bin(proto::encode(proto::LED, &[0; 3]).into()));
-                st.broadcast(Msg::Bin(proto::encode(proto::PANEL, &[0; 2]).into()));
                 if let Some(emu) = st.emu.clone() {
+                    emu.kemu_seen();
                     // The P4's RTC keeps the wall clock across resets on the
                     // board; here it starts as an RTC that kept its supply
                     // would, at the Mac's time.
                     let us = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_micros() as u64;
                     emu.send(proto::TIME, &us.to_le_bytes());
-                    emu.send(proto::RADIO, &[self.cfg.wifi as u8]);
-                    st.send_card();
                     st.send_battery();
                 }
             }
@@ -734,6 +690,14 @@ impl Bridge {
         }
         if let Some(f) = &*self.on_line.lock().unwrap_or_else(PoisonError::into_inner) {
             f(line);
+        }
+        if first_join(line) {
+            // The C5's vault starts blank, as a new board's does: the person
+            // joins the one network the simulator has once, as they would
+            // their own. An app that asks for WiFi then gets an address, as
+            // on a board that knows its network.
+            self.line(&format!("[kode-sim] joining {} for you: the C5 knows no network yet", crate::c5::SSID));
+            self.console_in(&format!("wifi_join ssid=\"{}\"", crate::c5::SSID));
         }
     }
 
@@ -883,13 +847,7 @@ impl Bridge {
     /// A JSON message from a page.
     pub async fn from_page_json(self: &Arc<Self>, j: &Value) {
         if let Some(sd) = j.get("sd") {
-            let mut st = self.lock();
-            if st.card.is_some() {
-                st.sd_in = truthy(sd);
-                st.send_card();
-                let j = json!({"sd": st.sd_in});
-                st.broadcast_json(j);
-            }
+            self.set_card_in(truthy(sd)).await;
         }
         if let Some(on) = j.get("mic") {
             let mut st = self.lock();
@@ -912,6 +870,36 @@ impl Bridge {
             Some("on") => self.power_on_from_page().await,
             Some("reset") => self.reset().await,
             _ => {}
+        }
+    }
+
+    /// The card into the slot or out of it. esp-emu takes no card in or out
+    /// while it runs, so a Kode Dot that is on restarts with the slot as it
+    /// now is, as one would with the card pulled under it.
+    async fn set_card_in(self: &Arc<Self>, sd_in: bool) {
+        let running = {
+            let mut st = self.lock();
+            if st.card.is_none() || st.sd_in == sd_in {
+                return;
+            }
+            st.sd_in = sd_in;
+            let j = json!({"sd": sd_in});
+            st.broadcast_json(j);
+            let running = st.running_emu().cloned();
+            if running.is_some() {
+                st.powering_off = true;
+            }
+            running
+        };
+        if let Some(emu) = running {
+            self.line(&format!(
+                "[kode-sim] the card {}: the Kode Dot restarts with it, as esp-emu cannot change the slot while it runs",
+                if sd_in { "goes in" } else { "comes out" }
+            ));
+            emu.stop().await;
+            if let Err(e) = self.power_on().await {
+                self.line(&format!("[kode-sim] the Kode Dot did not come back: {e}"));
+            }
         }
     }
 
@@ -1178,6 +1166,15 @@ pub(crate) fn truthy(v: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_c5_with_an_empty_vault_is_joined_to_the_simulator_s_network() {
+        assert!(first_join(
+            "!N 3741 kaos.radio C5: KODE services v3, 0 networks, 0 BLE keys, identity 0x00; heap 114016 B free"
+        ));
+        assert!(!first_join("!N 3741 kaos.radio C5: KODE services v3, 1 networks, 0 BLE keys, identity 0x00"));
+        assert!(!first_join("[kode-sim] joining kode-sim for you: the C5 knows no network yet"));
+    }
 
     /// Whatever the queue has now, and how many times it said the page
     /// was owed the picture; None if it ended (the page was let go).

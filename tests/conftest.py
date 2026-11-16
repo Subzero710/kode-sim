@@ -60,6 +60,12 @@ def fake_emu(tmp_path, monkeypatch):
     log = tmp_path / "launches"
     monkeypatch.setenv("KODE_SIM_ESP_EMU", str(exe))
     monkeypatch.setenv("FAKE_LAUNCH_LOG", str(log))
+    # The C5's image: the fake boots anything, so two empty files will do.
+    c5 = tmp_path / "c5"
+    c5.mkdir()
+    for f in ("merged-binary.bin", "kode_c5.elf"):
+        (c5 / f).write_bytes(b"")
+    monkeypatch.setenv("KODE_SIM_C5", str(c5))
     return log
 
 

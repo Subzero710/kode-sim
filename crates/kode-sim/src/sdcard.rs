@@ -102,10 +102,10 @@ fn make_card_diskutil(path: &Path, label: &str) -> Result<(), String> {
     }
 }
 
-/// A card image, its blocks read and written in place.
+/// A card image held for one simulator: esp-emu reads and writes its
+/// blocks (`--sd`), and this keeps a second simulator off it.
 pub struct Card {
-    file: File,
-    pub sectors: u64,
+    _file: File,
 }
 
 impl Card {
@@ -127,34 +127,7 @@ impl Card {
             }
             return Err(e);
         }
-        let sectors = file.metadata()?.len() / BLOCK as u64;
-        Ok(Card { file, sectors })
-    }
-
-    /// `count` blocks from `lba`, or nothing if that runs past the card's end.
-    pub fn read(&self, lba: u64, count: u64) -> Vec<u8> {
-        if lba + count > self.sectors {
-            return vec![];
-        }
-        let mut v = vec![0; count as usize * BLOCK];
-        match self.file.read_exact_at(&mut v, lba * BLOCK as u64) {
-            Ok(()) => v,
-            Err(_) => vec![],
-        }
-    }
-
-    /// Whole blocks from `lba`. Blocks that are not whole or do not fit are
-    /// an InvalidInput error (the firmware's); any other, the image's.
-    pub fn write(&self, lba: u64, data: &[u8]) -> io::Result<()> {
-        let bad = |why: String| Err(io::Error::new(io::ErrorKind::InvalidInput, why));
-        if !data.len().is_multiple_of(BLOCK) {
-            return bad(format!("{} bytes at block {lba} are not whole blocks", data.len()));
-        }
-        let n = (data.len() / BLOCK) as u64;
-        if lba + n > self.sectors {
-            return bad(format!("{n} blocks at {lba} run past the card's end ({} blocks)", self.sectors));
-        }
-        self.file.write_all_at(data, lba * BLOCK as u64)
+        Ok(Card { _file: file })
     }
 }
 
@@ -200,17 +173,6 @@ mod tests {
     }
 
     #[test]
-    fn a_write_the_image_refuses_is_an_error_of_its_own() {
-        let img = tmp("ro");
-        File::create(&img).unwrap().set_len(1024 * 1024).unwrap();
-        let file = File::open(&img).unwrap(); // read-only: every write fails
-        let card = Card { sectors: 2048, file };
-        let e = card.write(0, &[0; 512]).unwrap_err();
-        assert_ne!(e.kind(), io::ErrorKind::InvalidInput, "{e}");
-        std::fs::remove_dir_all(img.parent().unwrap()).unwrap();
-    }
-
-    #[test]
     fn a_card_is_in_one_simulator_at_a_time() {
         let img = tmp("lock");
         File::create(&img).unwrap().set_len(1024 * 1024).unwrap();
@@ -226,29 +188,6 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "still taken: {e}");
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        std::fs::remove_dir_all(img.parent().unwrap()).unwrap();
-    }
-
-    #[test]
-    fn a_card_reads_and_writes_blocks_in_place() {
-        let img = tmp("io");
-        File::create(&img).unwrap().set_len(64 * 1024 * 1024).unwrap();
-        let block: Vec<u8> = (0..=255u8).collect();
-        let two = block.repeat(4);
-        {
-            let card = Card::open(&img).unwrap();
-            assert_eq!(card.sectors, 64 * 2048);
-            card.write(5000, &two).unwrap();
-            assert_eq!(card.read(5000, 2), two);
-            assert!(card.read(card.sectors, 1).is_empty()); // past the end: nothing
-            let past = card.write(card.sectors, &[0; 512]).unwrap_err();
-            assert_eq!(past.kind(), io::ErrorKind::InvalidInput);
-            assert!(past.to_string().contains("past the card's end"), "{past}");
-            let torn = card.write(0, &[0; 100]).unwrap_err(); // not a whole block
-            assert_eq!(torn.kind(), io::ErrorKind::InvalidInput);
-        }
-        let d = std::fs::read(&img).unwrap();
-        assert_eq!(&d[5000 * 512..5001 * 512], &block.repeat(2)[..]);
         std::fs::remove_dir_all(img.parent().unwrap()).unwrap();
     }
 }

@@ -27,6 +27,35 @@ pub enum Claim {
     /// it hears what the chip sends on `dout` and feeds what it reads on
     /// `din`.
     I2s { dout: Option<u8>, din: Option<u8> },
+    /// The panel on this virtual channel of the MIPI-DSI link (0..3): it
+    /// hears the commands the firmware sends it and the frames it shows.
+    Dsi { vc: u8 },
+}
+
+/// The pixels of a DSI video stream ([`Dsi::Format`]): the frame buffer's
+/// own bytes, in memory order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DpiPixels {
+    /// 16-bit RGB565 words, little-endian.
+    Rgb565,
+    /// Three bytes a pixel: blue, green, red.
+    Bgr888,
+    /// One this crate does not know.
+    Other(u32),
+}
+
+/// What the DSI host sends the panel that claimed its virtual channel
+/// (DsiEvent).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Dsi {
+    /// One packet, as sent: the MIPI data type (0x05, 0x15, 0x39 for DCS
+    /// writes) and its bytes, the command first.
+    Command { dt: u8, data: Vec<u8> },
+    /// The video stream's shape, when it changes.
+    Format { streaming: bool, width: u32, height: u32, pixels: DpiPixels },
+    /// Rows of frame `frame` that differ from what the panel last saw,
+    /// `rows` whole rows from `y` in the stream's format.
+    Rows { frame: u64, y: u32, rows: u32, pixels: Vec<u8> },
 }
 
 /// What the samples of one I2S direction look like (I2sFormat): sent when
@@ -82,6 +111,8 @@ pub enum Payload {
     /// What the chip clocked out since the last one: frames of the transmit
     /// format, interleaved, little-endian.
     I2sOut(Vec<u8>),
+    /// For the panel on a DSI virtual channel.
+    Dsi(Dsi),
     Other,
 }
 
@@ -190,6 +221,11 @@ pub fn register(name: &str, claims: &[Claim]) -> Vec<u8> {
                     vf(&mut i2s, 4, p as u64);
                 }
                 ld(&mut inner, 17, &i2s);
+            }
+            Claim::Dsi { vc } => {
+                let mut dsi = vec![];
+                vf(&mut dsi, 1, vc as u64);
+                ld(&mut inner, 20, &dsi);
             }
         }
         ld(&mut reg, 3, &inner);
@@ -317,10 +353,34 @@ pub fn decode(buf: &[u8]) -> Option<Message> {
                 let pcm = fields(b)?.into_iter().find(|f| f.0 == 1).map_or(vec![], |f| f.2.to_vec());
                 m.payload = Payload::I2sOut(pcm);
             }
+            36 => m.payload = Payload::Dsi(dsi_event(b)?),
             _ => {}
         }
     }
     Some(m)
+}
+
+/// A DsiEvent's one field.
+fn dsi_event(b: &[u8]) -> Option<Dsi> {
+    let (n, _, inner) = *fields(b)?.first()?;
+    let f = fields(inner)?;
+    let varint = |k: u32| f.iter().find(|x| x.0 == k).map_or(0, |x| x.1);
+    let bytes = |k: u32| f.iter().find(|x| x.0 == k).map_or(vec![], |x| x.2.to_vec());
+    Some(match n {
+        1 => Dsi::Command { dt: varint(1) as u8, data: bytes(2) },
+        2 => Dsi::Format {
+            streaming: varint(1) != 0,
+            width: varint(2) as u32,
+            height: varint(3) as u32,
+            pixels: match varint(4) {
+                1 => DpiPixels::Rgb565,
+                2 => DpiPixels::Bgr888,
+                o => DpiPixels::Other(o as u32),
+            },
+        },
+        3 => Dsi::Rows { frame: varint(1), y: varint(2) as u32, rows: varint(3) as u32, pixels: bytes(4) },
+        _ => return None,
+    })
 }
 
 // ---- Framing ----------------------------------------------------------------
