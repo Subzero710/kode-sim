@@ -60,7 +60,7 @@ pub fn saved_flash(merged: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
         )));
     }
     let stamp = work.join("flash.bin.sha1");
-    let built = format!("{:x}", Sha1::digest(std::fs::read(merged)?));
+    let built: String = Sha1::digest(std::fs::read(merged)?).iter().map(|b| format!("{b:02x}")).collect();
     let seeded = std::fs::read_to_string(&stamp).ok();
     if !flash.exists() || seeded.as_deref().map(str::trim) != Some(built.as_str()) {
         let fresh = work.join("flash.bin.new");
