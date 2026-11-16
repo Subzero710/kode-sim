@@ -33,6 +33,8 @@ use crate::proto;
 /// USB_BUS kinds.
 pub const BUS_CABLE_OUT: u8 = 0;
 pub const BUS_CABLE_IN: u8 = 1;
+/// Reset the attached bus without moving its cable.
+pub const BUS_RESET: u8 = 4;
 /// USB_DEV kinds.
 pub const DEV_PULLUP: u8 = 1;
 pub const DEV_STALL: u8 = 2;
@@ -102,6 +104,8 @@ pub enum Cmd {
     Plug,
     /// Pull the cable out, ejected or not.
     Unplug,
+    /// Reset and enumerate the device again, keeping the cable plugged in.
+    Reset,
     /// Eject the disk as a computer does, and let go of it.
     Eject,
     /// Look at the disk again.
@@ -125,6 +129,7 @@ impl Cmd {
         Some(match j.get("cmd")?.as_str()? {
             "plug" => Cmd::Plug,
             "unplug" => Cmd::Unplug,
+            "reset" => Cmd::Reset,
             "eject" => Cmd::Eject,
             "list" => Cmd::List,
             "put" => {
@@ -491,6 +496,14 @@ impl Host {
                     self.keys_down.clear();
                     self.error.clear();
                     self.publish(true);
+                }
+            }
+            Cmd::Reset => {
+                if self.cable && self.pullup {
+                    self.gone("the computer resets the bus");
+                    self.stage = Stage::Waiting;
+                    self.publish(true);
+                    (self.wire)(proto::USB_BUS, &[BUS_RESET]);
                 }
             }
             Cmd::Layout(l) => {
@@ -1769,6 +1782,7 @@ mod tests {
         fn frame(&mut self, t: u8, p: &[u8]) -> Vec<(u8, Vec<u8>)> {
             match t {
                 proto::USB_BUS if p[0] == BUS_CABLE_IN => vec![(proto::USB_DEV, vec![DEV_PULLUP, 1, 0, 0])],
+                proto::USB_BUS if p[0] == BUS_RESET => vec![],
                 proto::USB_BUS => vec![(proto::USB_DEV, vec![DEV_PULLUP, 0, 0, 0])],
                 proto::USB_SETUP => self.setup(p),
                 proto::USB_OUT if p[0] == 0 => vec![],
@@ -1996,6 +2010,25 @@ mod tests {
         assert_eq!(setups[0][1], 6, "GET_DESCRIPTOR first");
         assert!(setups.iter().any(|s| s[1] == 5 && s[2] == 1), "SET_ADDRESS 1");
         assert!(setups.iter().any(|s| s[1] == 9 && s[2] == 1), "SET_CONFIGURATION 1");
+    }
+
+    #[test]
+    fn a_bus_reset_enumerates_the_same_disk_without_toggling_its_cable() {
+        let r = rig(Fake::new(volume(4)));
+        r.host.command(Cmd::Plug);
+        r.stage("mounted");
+        r.host.command(Cmd::from_json(&json!({"cmd": "reset"})).unwrap());
+        let u = r.wait("the reset and second enumeration", |u| {
+            u["stage"] == "mounted"
+                && u["disk"]["files"].as_array().is_some_and(|files| files.iter().any(|f| f["name"] == "hello.txt"))
+                && u["log"].as_array().unwrap().iter().filter(|l| l.as_str().unwrap().contains("SET_ADDRESS 1")).count()
+                    == 2
+        });
+        assert_eq!(u["cable"], true);
+        assert_eq!(u["disk"]["files"][0]["name"], "hello.txt");
+        let wire = r.wired.lock().unwrap();
+        let bus: Vec<&Vec<u8>> = wire.iter().filter(|f| f.0 == proto::USB_BUS).map(|f| &f.1).collect();
+        assert_eq!(bus, vec![&vec![BUS_CABLE_IN], &vec![BUS_RESET]]);
     }
 
     #[test]

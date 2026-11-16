@@ -1,0 +1,5 @@
+menu "USB lifecycle regression fixture"
+    config USB_TEST_DIRECT
+        bool "Application owns the TinyUSB task and descriptors"
+        default n
+endmenu
