@@ -288,6 +288,10 @@ struct Host {
     emit: Emit,
     cable: bool,
     pullup: bool,
+    /// The firmware restarted and its new boot has not raised its pull-up
+    /// yet: whatever comes in until then was the old boot's, answered as it
+    /// went (a sector of a read under way), and is not the new one's.
+    restarting: bool,
     stage: Stage,
     error: String,
     dev: DeviceInfo,
@@ -329,6 +333,7 @@ impl Host {
             emit,
             cable: false,
             pullup: false,
+            restarting: false,
             stage: Stage::NoCable,
             error: String::new(),
             dev: DeviceInfo::default(),
@@ -382,6 +387,7 @@ impl Host {
     /// One thing the firmware or the page did, into the state.
     fn apply(&mut self, ev: Ev) {
         match ev {
+            Ev::In(..) | Ev::Ack(..) if self.restarting => {}
             Ev::In(ep, data) => {
                 if ep == 0x80 {
                     self.ctl.push_back(data);
@@ -396,6 +402,9 @@ impl Host {
             }
             Ev::Dev(DEV_PULLUP, up) => {
                 self.pullup = up != 0;
+                if self.pullup {
+                    self.restarting = false;
+                }
                 self.say(format!("the device {} its pull-up", if self.pullup { "raises" } else { "drops" }));
                 if !self.pullup {
                     self.gone("the device let go of the bus");
@@ -413,6 +422,7 @@ impl Host {
             Ev::Cmd(c) => self.cmds.push_back(c),
             Ev::Rebooted => {
                 self.pullup = false;
+                self.restarting = true;
                 self.gone("the Kode Dot restarted");
                 if self.cable {
                     // The cable did not move: the new boot finds it in.
@@ -2092,6 +2102,33 @@ mod tests {
         });
         let n = r.wired.lock().unwrap().iter().filter(|f| f.0 == proto::USB_BUS && f.1 == [BUS_CABLE_IN]).count();
         assert_eq!(n, 2, "the cable is announced to the new boot");
+    }
+
+    #[test]
+    fn data_left_from_before_a_restart_is_not_taken_for_the_new_boot_s() {
+        let r = rig(Fake::new(volume(4)));
+        r.host.command(Cmd::Plug);
+        r.stage("mounted");
+        {
+            // Held, the fake cannot raise the new boot's pull-up until a
+            // sector read before the restart is in: the order a busy machine
+            // can give them. Data carries no tag to tell it by.
+            let _held = r.fake.lock().unwrap();
+            r.host.rebooted();
+            let mut stale = vec![0x81];
+            stale.extend_from_slice(&[0xAB; 64]);
+            r.host.firmware_said(proto::USB_IN, &stale);
+        }
+        r.wait("a second enumeration", |u| {
+            u["stage"] == "mounted"
+                && u["log"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|l| l.as_str().unwrap().contains("SET_CONFIGURATION"))
+                    .count()
+                    == 2
+        });
     }
 
     #[test]

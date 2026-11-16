@@ -4,6 +4,16 @@ What changes from one kode-sim release to the next. The versions follow
 [SemVer](https://semver.org): until 1.0 a minor release (0.2, 0.3…) may
 change how kode-sim is used, and says so here.
 
+## [Unreleased]
+
+### Fixed
+
+- **The USB host takes nothing from a Kode Dot that restarted until its new
+  boot raises its pull-up.** A sector of a read under way when the firmware
+  restarted could reach the computer after the restart, and the new boot's
+  enumeration took it for its own data: "a bad command status wrapper". It
+  showed on a slower machine (GitHub's Linux runner).
+
 ## [0.2.0] - 2026-11-13
 
 kode-sim is open source (GPL-3.0-or-later), and a window of its own. On
