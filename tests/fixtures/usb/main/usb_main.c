@@ -1,6 +1,7 @@
 /* A boot keyboard exercised through either the real ESP-TinyUSB driver or
  * an application's own TinyUSB lifecycle. No board services are started. */
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 #include "driver/usb_serial_jtag.h"
 #include "esp_err.h"
@@ -13,13 +14,49 @@
 #include "tinyusb_default_config.h"
 #include "device/dcd.h"
 
-static const uint8_t report_desc[] = { TUD_HID_REPORT_DESC_KEYBOARD() };
+/* IDs are fixture data and are shared by the descriptor and sender. The
+ * host must discover them from the descriptors, including these non-boot IDs. */
+enum { TEST_REPORT_KEYBOARD = 43, TEST_REPORT_MOUSE = 207 };
+#if defined(CONFIG_USB_TEST_SEPARATE)
+enum { TEST_ITF_KEYBOARD, TEST_ITF_MOUSE, TEST_ITF_COUNT };
+enum { TEST_INSTANCE_KEYBOARD, TEST_INSTANCE_MOUSE };
+static const uint8_t keyboard_desc[] = { TUD_HID_REPORT_DESC_KEYBOARD() };
+static const uint8_t mouse_desc[] = { TUD_HID_REPORT_DESC_MOUSE() };
+static const uint8_t config_desc[] = {
+    TUD_CONFIG_DESCRIPTOR(1, TEST_ITF_COUNT, 0, TUD_CONFIG_DESC_LEN + TEST_ITF_COUNT * TUD_HID_DESC_LEN,
+                          TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
+    TUD_HID_DESCRIPTOR(TEST_ITF_KEYBOARD, 0, HID_ITF_PROTOCOL_KEYBOARD, sizeof keyboard_desc,
+                       0x81, CFG_TUD_HID_EP_BUFSIZE, 10),
+    TUD_HID_DESCRIPTOR(TEST_ITF_MOUSE, 0, HID_ITF_PROTOCOL_MOUSE, sizeof mouse_desc,
+                       0x82, CFG_TUD_HID_EP_BUFSIZE, 10),
+};
+#else
+enum { TEST_INSTANCE_KEYBOARD, TEST_INSTANCE_MOUSE = TEST_INSTANCE_KEYBOARD };
+static const uint8_t report_desc[] = {
+#if defined(CONFIG_USB_TEST_SHARED)
+    TUD_HID_REPORT_DESC_KEYBOARD(HID_REPORT_ID(TEST_REPORT_KEYBOARD)),
+    TUD_HID_REPORT_DESC_MOUSE(HID_REPORT_ID(TEST_REPORT_MOUSE)),
+#elif defined(CONFIG_USB_TEST_MOUSE)
+    TUD_HID_REPORT_DESC_MOUSE(),
+#else
+    TUD_HID_REPORT_DESC_KEYBOARD(),
+#endif
+};
 static const uint8_t config_desc[] = {
     TUD_CONFIG_DESCRIPTOR(1, 1, 0, TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN,
                           TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
+#if defined(CONFIG_USB_TEST_SHARED)
+    TUD_HID_DESCRIPTOR(0, 0, HID_ITF_PROTOCOL_NONE, sizeof report_desc,
+                       0x81, CFG_TUD_HID_EP_BUFSIZE, 10),
+#elif defined(CONFIG_USB_TEST_MOUSE)
+    TUD_HID_DESCRIPTOR(0, 0, HID_ITF_PROTOCOL_MOUSE, sizeof report_desc,
+                       0x81, CFG_TUD_HID_EP_BUFSIZE, 10),
+#else
     TUD_HID_DESCRIPTOR(0, 0, HID_ITF_PROTOCOL_KEYBOARD, sizeof report_desc,
                        0x81, sizeof(hid_keyboard_report_t), 10),
+#endif
 };
+#endif
 static const tusb_desc_device_t device_desc = {
     .bLength = sizeof(tusb_desc_device_t), .bDescriptorType = TUSB_DESC_DEVICE,
     .bcdUSB = 0x0200, .bMaxPacketSize0 = CFG_TUD_ENDPOINT0_SIZE,
@@ -30,7 +67,15 @@ static const char *strings[] = { (const char[]){0x09, 0x04}, "kode-sim", "ESP-Ti
 static unsigned mounts, unmounts;
 
 uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance)
-{ (void)instance; return report_desc; }
+{
+#if defined(CONFIG_USB_TEST_SEPARATE)
+    if (instance == TEST_INSTANCE_KEYBOARD) { return keyboard_desc; }
+    if (instance == TEST_INSTANCE_MOUSE) { return mouse_desc; }
+    return NULL;
+#else
+    return instance == TEST_INSTANCE_KEYBOARD ? report_desc : NULL;
+#endif
+}
 uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t type,
                               uint8_t *buffer, uint16_t size)
 { (void)instance; (void)report_id; (void)type; (void)buffer; (void)size; return 0; }
@@ -150,8 +195,18 @@ static void command(const char *line)
     else if (strcmp(line, "yield") == 0) { vTaskDelay(1); ret = ESP_OK; }
     else if (strcmp(line, "bad_phy") == 0) { ret = usb_del_phy((usb_phy_handle_t)&mounts); }
     else if (strcmp(line, "report") == 0) {
+#if !defined(CONFIG_USB_TEST_MOUSE)
         uint8_t keys[6] = { HID_KEY_A };
-        ret = tud_hid_keyboard_report(0, 0, keys) ? ESP_OK : ESP_FAIL;
+        ret = tud_hid_n_keyboard_report(TEST_INSTANCE_KEYBOARD,
+#if defined(CONFIG_USB_TEST_SHARED)
+                                       TEST_REPORT_KEYBOARD,
+#else
+                                       0,
+#endif
+                                       0, keys) ? ESP_OK : ESP_FAIL;
+#else
+        ret = ESP_ERR_NOT_SUPPORTED;
+#endif
     }
 #ifndef CONFIG_USB_TEST_DIRECT
     else if (strcmp(line, "invalid") == 0) { ret = tinyusb_driver_install(NULL); }
@@ -175,6 +230,39 @@ static void command(const char *line)
         ret = ESP_OK;
     }
 #endif
+    else if (strncmp(line, "key ", 4U) == 0) {
+#if !defined(CONFIG_USB_TEST_MOUSE)
+        unsigned mods, key; char extra;
+        if (sscanf(line + 4, "%u %u %c", &mods, &key, &extra) == 2 && mods <= UINT8_MAX && key <= UINT8_MAX) {
+            uint8_t keys[6] = { (uint8_t)key };
+            ret = tud_hid_n_keyboard_report(TEST_INSTANCE_KEYBOARD,
+#if defined(CONFIG_USB_TEST_SHARED)
+                                           TEST_REPORT_KEYBOARD,
+#else
+                                           0,
+#endif
+                                           (uint8_t)mods, keys) ? ESP_OK : ESP_FAIL;
+        }
+#else
+        ret = ESP_ERR_NOT_SUPPORTED;
+#endif
+    } else if (strncmp(line, "mouse ", 6U) == 0) {
+#if defined(CONFIG_USB_TEST_MOUSE) || defined(CONFIG_USB_TEST_SEPARATE) || defined(CONFIG_USB_TEST_SHARED)
+        unsigned buttons; int x, y, wheel; char extra;
+        if (sscanf(line + 6, "%u %d %d %d %c", &buttons, &x, &y, &wheel, &extra) == 4 && buttons <= UINT8_MAX
+            && x >= INT8_MIN && x <= INT8_MAX && y >= INT8_MIN && y <= INT8_MAX && wheel >= INT8_MIN && wheel <= INT8_MAX) {
+            ret = tud_hid_n_mouse_report(TEST_INSTANCE_MOUSE,
+#if defined(CONFIG_USB_TEST_SHARED)
+                                        TEST_REPORT_MOUSE,
+#else
+                                        0,
+#endif
+                                        (uint8_t)buttons, (int8_t)x, (int8_t)y, (int8_t)wheel, 0) ? ESP_OK : ESP_FAIL;
+        }
+#else
+        ret = ESP_ERR_NOT_SUPPORTED;
+#endif
+    }
     printf("USB result %s %s\n", line, esp_err_to_name(ret));
     fflush(stdout);
 }

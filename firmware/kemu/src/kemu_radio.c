@@ -47,11 +47,12 @@ static volatile uint8_t s_link = (uint8_t)KRADIO_OFF;   /* nobody has asked for 
 static volatile uint32_t s_ip4;                         /* network byte order; 0 until DHCP */
 static bool s_wifi_want;
 
-static void publish_link(kradio_link_t link)
+static bool publish_link(kradio_link_t link)
 {
-    s_link = (uint8_t)link;
     RadioStateEvt *const e = Q_NEW_X(RadioStateEvt, 0U, RADIO_STATE_SIG);
+    bool const posted = e != NULL;
     if (e != NULL) {
+        s_link = (uint8_t)link;
         e->link = (uint8_t)link;
         e->fw_known = false;
         e->fw_major = 0U;
@@ -60,12 +61,14 @@ static void publish_link(kradio_link_t link)
         e->sd_hosted = false;
         QACTIVE_PUBLISH(&e->super, (void *)0);
     }
+    return posted;
 }
 
-static void publish_wifi(void)
+static bool publish_wifi(void)
 {
     bool const on = (s_link == (uint8_t)KRADIO_UP) && (s_ip4 != 0U);
     WifiStateEvt *const e = Q_NEW_X(WifiStateEvt, 0U, WIFI_STATE_SIG);
+    bool const posted = e != NULL;
     if (e != NULL) {
         e->state = (uint8_t)(on ? WIFI_GOT_IP : WIFI_IDLE);
         e->ip4 = on ? s_ip4 : 0U;
@@ -74,6 +77,7 @@ static void publish_wifi(void)
         e->enabled = s_wifi_want;
         QACTIVE_PUBLISH(&e->super, (void *)0);
     }
+    return posted;
 }
 
 /* The card goes back on its path before the link is said to be anything. */
@@ -117,33 +121,36 @@ void kemu_radio_start(void)
     kemu_on(KEMU_T_RADIO, on_radio);
 }
 
-__attribute__((weak)) void radio_state_request(void)
+__attribute__((weak)) bool radio_state_request(void)
 {
-    publish_link((kradio_link_t)s_link);
+    return publish_link((kradio_link_t)s_link);
 }
 
-__attribute__((weak)) void wifi_start_request(void)
+__attribute__((weak)) bool wifi_start_request(void)
 {
     s_wifi_want = true;
     if (s_link == (uint8_t)KRADIO_UP) {
-        publish_wifi();
-        return;
+        return publish_wifi();
     }
-    publish_link(KRADIO_STARTING);
+    if (!publish_link(KRADIO_STARTING)) {
+        return false;
+    }
     if (!s_c5 || !kemu_net_start(on_ip)) {
         failed();            /* where the board takes the C5's bring-up timeout */
     } else if (s_ip4 != 0U) {
         on_ip(s_ip4);        /* a lease from before: the link is back at once */
     }
+    return true;
 }
 
-__attribute__((weak)) void wifi_state_request(void)
+__attribute__((weak)) bool wifi_state_request(void)
 {
-    publish_wifi();
+    return publish_wifi();
 }
 
 /* No answer on the board either: the wish only matters on a connected station. */
-__attribute__((weak)) void wifi_fast_request(bool on)
+__attribute__((weak)) bool wifi_fast_request(bool on)
 {
     (void)on;
+    return true;
 }
