@@ -1,9 +1,9 @@
-# Descriptor-driven USB HID (phase 2)
+# Descriptor-driven USB HID
 
 The virtual computer enumerates keyboard and mouse interfaces through the
 existing kemu USB controller. No keyboard or pointer input is injected into
-the operating system. This phase adds host behaviour and observable state;
-it does not add a pointer UI.
+the operating system. The web panel “Ordenador (USB)” displays the decoded
+keyboard state and a mouse cursor inside the virtual computer's desktop.
 
 ## Enumeration and transport
 
@@ -105,6 +105,7 @@ available. Multiple active interfaces are announced as a composite device.
 | `interfaces[]` | All interface numbers/alternates, class values, endpoints and HID metadata |
 | `interfaces[].active` | Whether default alternate zero is selected |
 | `interfaces[].keyboard`, `.mouse` | Capabilities discovered from Input fields and application usages |
+| `interfaces[].buttons` | Sorted Button usages declared by mouse Input fields, available before the first press |
 | `interfaces[].reports[]` | Declared input `report_id` and complete byte `length` |
 | `interfaces[].collections[]` | Descriptor collection indices, parents, types and usages |
 | `interfaces[].error`, `.diagnostics` | Driver/report errors and unsupported constructs |
@@ -136,6 +137,56 @@ text remains, preserving the existing `clear_typed` behaviour. The existing
 phase-1 restart barrier drops old-boot transfers until the new boot's pull-up;
 no wire protocol or firmware delivery barrier is replaced.
 
+## Web visualization (phase 3)
+
+Keyboard and mouse sections use `hid.keyboard` and `hid.mouse`, independently
+of `stage`. A composite MSC/HID device retains its file list and disk commands
+alongside its keyboard and mouse. Interface numbers, interrupt IN endpoints,
+Report IDs and collection identities are displayed without selecting a
+preferred interface. Keyboard usages and modifier state come from the decoded
+Rust snapshot; the page does not translate usages into text. `typed` and
+`layout` always follow the server, including while HID is unavailable.
+
+Each mouse source has its own previous sequence, cumulative totals and button
+transition counters, keyed by the complete interface/endpoint/Report
+ID/collection tuple. The first snapshot after opening a WebSocket establishes
+a baseline and shows current held keys and buttons immediately. It does not
+animate historical motion or count historical clicks as new. Sources that
+first appear in later snapshots contribute their new cumulative motion and
+transitions from zero. Repeated snapshots do not add movement or transitions.
+The latest relative values remain visible as diagnostics; only differences
+in cumulative relative totals move the cursor or advance the wheel display.
+Absolute values are displayed separately and never converted into deltas.
+
+Button badges distinguish the current union of held buttons from newly
+observed press and release counts. Both edges of a click remain visible when
+the button is already released at publication time. Per-source readouts show
+the received sequence and totals and describe accumulated new transitions
+without inventing their order. Declared buttons are shown even before input
+arrives; unknown Button usages keep their numeric labels.
+
+The cursor's bounds are the desktop's current DOM client dimensions minus the
+cursor's measured size. A `ResizeObserver` clamps the position after layout
+changes, including small screens and expanded embed controls. Movement
+received while the desktop has no layout is retained until it can be shown.
+The cursor is a graphical element inside the USB panel and never draws on the
+AMOLED canvas or invokes host input, Pointer Lock or WebHID APIs.
+
+Snapshots that remove HID capabilities clear transient state. Removing a
+source removes its local counters; removing all mouse sources clears the
+virtual mouse session. Counter decreases establish a new baseline without
+replaying motion or transitions. Endpoint closure publishes its empty source
+state immediately, so a close/reopen within the publication interval cannot
+hide a counter reset behind higher replacement counters. Firmware state
+changes, HELLO, POWER_OFF and WebSocket closure also clear held states,
+position and local counters. None of these local resets clears `typed`.
+
+`tests/test_page.mjs` exercises these DOM behaviours with the WebSocket JSON
+structure used by `Host::snapshot`, including composite devices, sparse
+buttons, all four source identity components, quick clicks, late clients,
+reconnection and layout changes. The parser's button metadata and immediate
+endpoint-closure publication have Rust regression tests.
+
 ## Tests and reproduction
 
 The pure parser tests cover standard/numbered keyboards, arrays, bitmaps,
@@ -165,6 +216,7 @@ original lifecycle fixture variants remain.
 Run from the repository root:
 
 ```sh
+node --test tests/test_page.mjs
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 cargo test --all-targets

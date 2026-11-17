@@ -438,6 +438,53 @@ impl Descriptor {
         })
     }
 
+    pub fn buttons(&self) -> Vec<u16> {
+        let mut ranges = Vec::new();
+        for ((kind, _), layout) in &self.reports {
+            if *kind != ReportKind::Input {
+                continue;
+            }
+            for field in &layout.fields {
+                if field.constant()
+                    || field.globals.count == 0
+                    || !field.application.is_some_and(|app| self.collections[app].mouse())
+                {
+                    continue;
+                }
+                let limit = if field.variable() {
+                    u64::from(field.globals.count)
+                } else {
+                    (field.globals.logical_max - field.globals.logical_min + 1) as u64
+                };
+                let mut position = 0;
+                for (first, last) in &field.locals.usages {
+                    let count = u64::from(last.id - first.id) + 1;
+                    let used = limit.saturating_sub(position).min(count);
+                    if first.page == PAGE_BUTTON && used > 0 {
+                        let end = (u64::from(first.id) + used - 1) as u16;
+                        if end > 0 {
+                            ranges.push((first.id.max(1), end));
+                        }
+                    }
+                    position += count;
+                    if position >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+        ranges.sort_unstable();
+        let mut merged: Vec<(u16, u16)> = Vec::new();
+        for (first, last) in ranges {
+            if let Some(previous) = merged.last_mut().filter(|r| first <= r.1.saturating_add(1)) {
+                previous.1 = previous.1.max(last);
+            } else {
+                merged.push((first, last));
+            }
+        }
+        merged.into_iter().flat_map(|(first, last)| first..=last).collect()
+    }
+
     /// Decode transactionally: no state is retained or changed on an error.
     pub fn input(&self, report: &[u8]) -> Result<Input, Error> {
         let (id, payload) = if self.has_ids {
@@ -669,6 +716,21 @@ mod tests {
             assert_eq!(m.relative, BTreeMap::from([(USAGE_X, 12), (USAGE_Y, -42), (USAGE_WHEEL, -1)]));
             assert!(m.absolute.is_empty());
         }
+    }
+
+    #[test]
+    fn declared_mouse_buttons_are_available_before_any_input() {
+        assert_eq!(Descriptor::parse(&mouse()).unwrap().buttons(), [1, 2, 3, 4, 5]);
+        assert!(Descriptor::parse(&keyboard()).unwrap().buttons().is_empty());
+        let sparse = hex("05 01 09 02 a1 01 05 09 09 02 09 07 09 09
+            15 00 25 01 75 01 95 02 81 02 75 06 95 01 81 01 c0");
+        assert_eq!(Descriptor::parse(&sparse).unwrap().buttons(), [2, 7]);
+        let array = hex("05 01 09 02 a1 01 05 09 19 00 29 08
+            15 00 25 04 75 08 95 01 81 00 c0");
+        assert_eq!(Descriptor::parse(&array).unwrap().buttons(), [1, 2, 3, 4]);
+        let mut multiple = test_support::numbered(mouse(), 43);
+        multiple.extend(test_support::numbered(sparse, 207));
+        assert_eq!(Descriptor::parse(&multiple).unwrap().buttons(), [1, 2, 3, 4, 5, 7]);
     }
 
     #[test]

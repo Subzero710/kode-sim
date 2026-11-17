@@ -490,7 +490,7 @@ impl Host {
                 self.dead.clear();
                 self.pending_hid.retain(|(source_ep, _)| ep != 0xff && *source_ep != ep);
                 self.ins.retain(|source_ep, _| ep != 0xff && *source_ep != ep);
-                self.publish(false);
+                self.publish(true);
             }
             Ev::Dev(..) => {}
             Ev::Cmd(c) => self.cmds.push_back(c),
@@ -666,6 +666,7 @@ impl Host {
                     "hid_descriptor": i.hid_descriptor, "report_length": i.report_length,
                     "keyboard": descriptor.is_some_and(hid::Descriptor::keyboard),
                     "mouse": descriptor.is_some_and(hid::Descriptor::mouse),
+                    "buttons": descriptor.map(hid::Descriptor::buttons).unwrap_or_default(),
                     "hid_protocol": descriptor.map(|_| "report"),
                     "error": driver.map(|h| h.error.as_str()).or_else(|| self.dev.interface_errors.get(&i.number).map(String::as_str)).unwrap_or(""),
                     "diagnostics": descriptor.map(|d| d.diagnostics.as_slice()).unwrap_or(&[]),
@@ -2636,6 +2637,8 @@ mod tests {
         assert_eq!(u["device"]["class"], "composite");
         assert_eq!(u["hid"]["keyboard"], true);
         assert_eq!(u["hid"]["mouse"], true);
+        assert_eq!(u["interfaces"][0]["buttons"], json!([1, 2, 3, 4, 5]));
+        assert_eq!(u["interfaces"][1]["buttons"], json!([]));
         assert_eq!(u["interfaces"][0]["number"], 7);
         assert_eq!(u["interfaces"][0]["endpoints"][0]["address"], 0x86);
         r.host.firmware_said(proto::USB_IN, &[0x83, 2, 0, 4, 0, 0, 0, 0, 0]);
@@ -2828,6 +2831,43 @@ mod tests {
         host.apply(Ev::In(0x83, vec![0, 0, 8, 0, 0, 0, 0, 0]));
         assert_eq!(host.typed, "A");
         assert!(host.hid_states.is_empty() && host.dead.is_empty());
+    }
+
+    #[test]
+    fn endpoint_closure_is_published_before_reopened_counters_can_overtake_the_old_state() {
+        let (_, rx) = mpsc::channel();
+        let snapshots = Arc::new(Mutex::new(Vec::new()));
+        let output = snapshots.clone();
+        let mut host = Host::new(rx, Arc::new(|_, _| {}), Arc::new(move |j| output.lock().unwrap().push(j)));
+        let f = composite_fake(&[(5, 0x83, hid::test_support::mouse())]);
+        host.parse_config(f.configuration.as_ref().unwrap()).unwrap();
+        host.hid.insert(
+            5,
+            HidInterface {
+                descriptor: Some(hid::Descriptor::parse(&hid::test_support::mouse()).unwrap()),
+                error: String::new(),
+            },
+        );
+        host.cable = true;
+        host.pullup = true;
+        host.stage = Stage::Mouse;
+        host.apply(Ev::In(0x83, vec![1, 10, 0, 0]));
+        host.apply(Ev::Dev(DEV_EP_CLOSE, 0x83));
+        {
+            let emitted = snapshots.lock().unwrap();
+            assert_eq!(emitted.len(), 2);
+            assert_eq!(emitted[0]["usb"]["hid"]["reports"][0]["mouse"]["sequence"], 1);
+            assert_eq!(emitted[1]["usb"]["hid"]["reports"], json!([]));
+            assert_eq!(emitted[1]["usb"]["mouse"]["buttons"], json!([]));
+        }
+        host.apply(Ev::Dev(DEV_EP_OPEN, 0x83));
+        for _ in 0..3 {
+            host.apply(Ev::In(0x83, vec![1, 10, 0, 0]));
+        }
+        host.publish(true);
+        let emitted = snapshots.lock().unwrap();
+        assert_eq!(emitted.last().unwrap()["usb"]["hid"]["reports"][0]["mouse"]["sequence"], 3);
+        assert_eq!(emitted.last().unwrap()["usb"]["hid"]["reports"][0]["mouse"]["total"]["x"], 30);
     }
 
     #[test]
