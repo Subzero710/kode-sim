@@ -2,9 +2,11 @@
 //! the board's chips beside it.
 //!
 //! The chips (the expander and its buttons, touch, LED, haptic, charger,
-//! gauge, codec) are esp-emu 1.0's virtual parts, answered here in-process
-//! over `--cosim-tcp` by [`crate::chips`]. What kemu still does - the
-//! screen, the sound, the microSD, the C5 and the console - travels as KD
+//! gauge, codec) and the AMOLED are esp-emu's virtual parts, answered here
+//! in-process over `--cosim-tcp` by [`crate::chips`]. The microSD is
+//! esp-emu's own (`--sd`), and the C5 is a second esp-emu running Kode's C5
+//! firmware, bridged to the P4 over SDIO (`--hosted`, [`crate::c5`]). What
+//! kemu still does - the USB port, the console, the clock - travels as KD
 //! frames over UART1.
 
 use std::io::{self, BufRead, BufReader};
@@ -20,16 +22,17 @@ use kodedot_chips::{Battery, Motion};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::TcpStream;
-use tokio::process::{ChildStdin, Command};
+use tokio::process::Command;
 use tokio::sync::{mpsc, watch};
 
 use crate::chips;
 use crate::proto;
 
-/// The esp-emu kode-sim runs: the first with virtual parts. Kept in
+/// The esp-emu kode-sim runs: the first with MIPI-DSI, SDMMC and a C5 as
+/// the ESP-Hosted slave. Kept in
 /// kode-sim's tools folder, so an esp-emu on PATH (another version,
 /// someone else's) is left be.
-pub const ESP_EMU_VERSION: &str = "1.0.0";
+pub const ESP_EMU_VERSION: &str = "1.1.0";
 const INSTALLER: &str = "https://raw.githubusercontent.com/espressif/esp-emulator/main/install.sh";
 /// The Kode Dot's PSRAM: 32 MB on the board, 16 MB if esp-emu is left to its default.
 const PSRAM: &str = "32M";
@@ -38,6 +41,9 @@ const CONSOLE_CHUNK: usize = 4096;
 const UART_WAIT: Duration = Duration::from_secs(20);
 const CHIPS_WAIT: Duration = Duration::from_secs(15);
 const STOP_WAIT: Duration = Duration::from_secs(5);
+const C5_WAIT: Duration = Duration::from_secs(10);
+/// The P4's pin on the C5's EN (CONFIG_ESP_HOSTED_SDIO_GPIO_RESET_SLAVE).
+const PIN_C5_RESET: &str = "23";
 
 /// kode-sim's cache: built firmware, its own esp-emu, the card, the notes.
 /// `$KODE_SIM_CACHE`, or the user's cache ([`user_cache`]).
@@ -127,6 +133,16 @@ pub async fn stop_all() {
     while !live().is_empty() && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    // A C5 stopped this way never ran its own clean-up: its socket and its
+    // run's flash, this process's alone.
+    let mine = format!("ksc5-{}-", std::process::id());
+    for dir in [std::env::temp_dir(), PathBuf::from("/tmp")] {
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            if e.file_name().to_string_lossy().starts_with(&mine) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
 }
 
 /// esp-emu's user-mode network, with the Mac's localhost ports forwarded to
@@ -151,8 +167,13 @@ pub struct Launch {
     pub forwards: Vec<(u16, u16)>,
     pub restrict: bool,
     /// The flash back into the firmware file when it stops, so what was
-    /// installed is there next time.
+    /// installed is there next time - and the C5's, its vault with it.
     pub save_state: bool,
+    /// The card image in the microSD slot (SDMMC slot 0); None, an empty slot.
+    pub sd: Option<PathBuf>,
+    /// Does the C5 come up? Without it the P4's SDIO link finds no card, as
+    /// on a board whose C5 is dead.
+    pub wifi: bool,
 }
 
 /// What the page changes on the board itself, for its chips rather than kemu.
@@ -190,8 +211,20 @@ pub struct Emu {
     clock: OnceLock<chips::Handle>,
     /// esp-emu's exit code once it has gone and its console is drained.
     gone: watch::Receiver<Option<i32>>,
-    /// Held open, as a pipe esp-emu may read: closing it would be an EOF.
-    _stdin: Mutex<Option<ChildStdin>>,
+    /// esp-emu's console input: lines for a firmware without kemu's console.
+    stdin: Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>,
+    /// Has kemu said HELLO: is the console kemu's, over UART1?
+    kemu: std::sync::atomic::AtomicBool,
+    /// The C5's esp-emu, if it came up: stopped with the P4's.
+    c5: Option<C5>,
+}
+
+/// The C5's esp-emu, and what it leaves behind.
+struct C5 {
+    pid: i32,
+    exit: watch::Receiver<Option<i32>>,
+    /// The socket and the run's flash.
+    scratch: Vec<PathBuf>,
 }
 
 /// The ends of a launched esp-emu its owner wires up once it holds the [`Emu`].
@@ -208,15 +241,19 @@ pub struct Wiring {
 /// from the moment it starts, from a thread of its own.
 pub async fn launch(cfg: &Launch, on_line: Arc<dyn Fn(String) + Send + Sync>) -> Result<(Arc<Emu>, Wiring), String> {
     let exe = ensure_esp_emu()?;
+    // Keep simultaneous ephemeral-port allocations distinct until esp-emu starts.
     let reserve = || TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string());
-    // Keep all three reservations alive while choosing addresses, so the OS
-    // cannot return the same ephemeral port for two emulator services.
     let uart_socket = reserve()?;
     let control_socket = reserve()?;
     let cosim_socket = reserve()?;
     let port = uart_socket.local_addr().map_err(|e| e.to_string())?.port();
     let control = control_socket.local_addr().map_err(|e| e.to_string())?.to_string();
     let cosim = cosim_socket.local_addr().map_err(|e| e.to_string())?.to_string();
+    if !exe.is_file() {
+        return Err(format!("could not start {}: there is no such file", exe.display()));
+    }
+    let c5 = if cfg.wifi { Some(start_c5(&exe, cfg).await?) } else { None };
+    let sock = c5.as_ref().map(|c| c.scratch[0].clone());
     let (out_r, out_w) = io::pipe().map_err(|e| e.to_string())?;
     let out_w2 = out_w.try_clone().map_err(|e| e.to_string())?;
     let mut cmd = Command::new(&exe);
@@ -228,7 +265,17 @@ pub async fn launch(cfg: &Launch, on_line: Arc<dyn Fn(String) + Send + Sync>) ->
         .args(["--uart1-tcp", &format!("127.0.0.1:{port}")])
         .args(["--control-tcp", &control])
         .args(["--cosim-tcp", &cosim])
-        .args(["--net", &net_arg(&cfg.forwards, cfg.restrict)]);
+        // The Kode Dot's console is its USB-Serial/JTAG. A board image also
+        // opens a CDC console on the USB-OTG port, which esp-emu would print
+        // beside it, every line twice.
+        .args(["--console", "usb-jtag"]);
+    if let Some(sd) = &cfg.sd {
+        cmd.arg("--sd").arg(sd_arg(sd));
+    }
+    if let Some(sock) = &sock {
+        cmd.arg("--hosted").arg(format!("bridge:host:{}", sock.display()));
+        cmd.args(["--hosted-reset-gpio", PIN_C5_RESET]);
+    }
     if cfg.save_state {
         cmd.arg("--save-state");
     }
@@ -236,11 +283,30 @@ pub async fn launch(cfg: &Launch, on_line: Arc<dyn Fn(String) + Send + Sync>) ->
     // lines come out in the order they were written.
     cmd.stdin(Stdio::piped()).stdout(out_w).stderr(out_w2).kill_on_drop(true);
     drop((uart_socket, control_socket, cosim_socket));
-    let mut child = cmd.spawn().map_err(|e| format!("could not start {}: {e}", exe.display()))?;
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            if let Some(c5) = c5 {
+                c5.stop().await;
+            }
+            return Err(format!("could not start {}: {e}", exe.display()));
+        }
+    };
     drop(cmd); // our copies of the pipe's write end, or its reader never sees EOF
     let pid = child.id().unwrap_or(0) as i32;
     LIVE.lock().unwrap_or_else(PoisonError::into_inner).push(pid);
-    let stdin = child.stdin.take();
+    let stdin = child.stdin.take().map(|mut w| {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        tokio::spawn(async move {
+            while let Some(b) = rx.recv().await {
+                if w.write_all(&b).await.is_err() || w.flush().await.is_err() {
+                    break;
+                }
+            }
+            drop(w);
+        });
+        tx
+    });
 
     let (drained_tx, mut drained_rx) = watch::channel(false);
     std::thread::spawn(move || {
@@ -283,7 +349,9 @@ pub async fn launch(cfg: &Launch, on_line: Arc<dyn Fn(String) + Send + Sync>) ->
         resets: AtomicU64::new(0),
         clock: OnceLock::new(),
         gone,
-        _stdin: Mutex::new(stdin),
+        stdin: Mutex::new(stdin),
+        kemu: std::sync::atomic::AtomicBool::new(false),
+        c5,
     };
     let fail = |emu: Emu, e: String| async move {
         emu.stop().await;
@@ -377,6 +445,98 @@ impl Drop for Unlaunched {
     }
 }
 
+/// `--sd`: the image in the Kode Dot's slot, SDMMC slot 0.
+fn sd_arg(image: &std::path::Path) -> String {
+    format!("{},slot=0", image.display())
+}
+
+/// Where the C5's socket and run flash go: short, as a Unix socket's path
+/// must be (104 bytes on the Mac), and this run's alone.
+fn c5_scratch(name: &str) -> PathBuf {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::SeqCst);
+    let file = format!("ksc5-{}-{n}-{name}", std::process::id());
+    let p = std::env::temp_dir().join(&file);
+    if p.as_os_str().len() < 100 {
+        p
+    } else {
+        PathBuf::from("/tmp").join(file)
+    }
+}
+
+/// The C5's esp-emu, listening on its SDIO socket: Kode's C5 firmware, the
+/// network behind it (esp-emu's open soft AP, [`crate::c5::SSID`], NAT'd
+/// through the Mac, with the forwards), its console into the cache's c5.log.
+async fn start_c5(exe: &std::path::Path, cfg: &Launch) -> Result<C5, String> {
+    let img = tokio::task::spawn_blocking(crate::c5::ensure).await.map_err(|e| e.to_string())?.map_err(|e| e.0)?;
+    let sock = c5_scratch("h.sock");
+    let _ = std::fs::remove_file(&sock);
+    let run = c5_scratch("flash.bin");
+    let kept = cfg.save_state.then(|| cache_dir().join("c5").join("flash.bin"));
+    let flash = crate::c5::flash_for(&img, kept.as_deref(), &run).map_err(|e| format!("the C5's flash: {e}"))?;
+    let log_path = cache_dir().join("c5.log");
+    let _ = std::fs::create_dir_all(cache_dir());
+    let log = std::fs::File::create(&log_path).map_err(|e| format!("{}: {e}", log_path.display()))?;
+    let log2 = log.try_clone().map_err(|e| e.to_string())?;
+    let mut cmd = Command::new(exe);
+    cmd.args(["--chip", "esp32c5"]).arg("--firmware").arg(&flash).arg("--elf").arg(&img.elf);
+    cmd.arg("--hosted").arg(format!("bridge:slave:{}", sock.display()));
+    cmd.args(["--net", &net_arg(&cfg.forwards, cfg.restrict)]);
+    cmd.args(["--wifi-ssid", crate::c5::SSID, "--wifi-password", ""]);
+    if kept.is_some() {
+        cmd.arg("--save-state");
+    }
+    cmd.stdin(Stdio::null()).stdout(log).stderr(log2).kill_on_drop(true);
+    let mut child = cmd.spawn().map_err(|e| format!("could not start the C5's {}: {e}", exe.display()))?;
+    let pid = child.id().unwrap_or(0) as i32;
+    LIVE.lock().unwrap_or_else(PoisonError::into_inner).push(pid);
+    let (exit_tx, exit) = watch::channel(None::<i32>);
+    tokio::spawn(async move {
+        let rc = match child.wait().await {
+            Ok(s) => s.code().unwrap_or_else(|| -s.signal().unwrap_or(0)),
+            Err(_) => -1,
+        };
+        LIVE.lock().unwrap_or_else(PoisonError::into_inner).retain(|p| *p != pid);
+        let _ = exit_tx.send(Some(rc));
+    });
+    let mut scratch = vec![sock.clone()];
+    if kept.is_none() {
+        scratch.push(run);
+    }
+    let c5 = C5 { pid, exit, scratch };
+    let deadline = tokio::time::Instant::now() + C5_WAIT;
+    while !sock.exists() {
+        let exited = *c5.exit.borrow();
+        if let Some(rc) = exited {
+            c5.stop().await;
+            return Err(format!("the C5's esp-emu exited with {rc} as it started: see {}", log_path.display()));
+        }
+        if tokio::time::Instant::now() > deadline {
+            c5.stop().await;
+            return Err(format!("the C5's esp-emu never opened its SDIO socket: see {}", log_path.display()));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(c5)
+}
+
+impl C5 {
+    async fn stop(&self) {
+        let mut exit = self.exit.clone();
+        let running = exit.borrow().is_none();
+        if running && self.pid > 0 {
+            unsafe { libc::kill(self.pid, libc::SIGTERM) };
+            if tokio::time::timeout(STOP_WAIT, exit.wait_for(|r| r.is_some())).await.is_err() {
+                unsafe { libc::kill(self.pid, libc::SIGKILL) };
+                let _ = exit.wait_for(|r| r.is_some()).await;
+            }
+        }
+        for p in &self.scratch {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 fn chips_failed(why: &str) -> String {
     format!("the board's chips did not attach to esp-emu (is it {ESP_EMU_VERSION} or newer?): {why}")
 }
@@ -406,10 +566,28 @@ impl Emu {
         self.console_bytes(&data);
     }
 
-    /// Console input, any bytes. Over UART1 rather than esp-emu's stdin,
-    /// which hands a line over only once its newline arrives - no use for a
-    /// binary payload.
+    /// kemu said HELLO: from now the console is its own, over UART1.
+    pub fn kemu_seen(&self) {
+        self.kemu.store(true, Ordering::SeqCst);
+    }
+
+    /// The chip reset: until the next HELLO the firmware may be one without
+    /// kemu (an app a kodeOS built for the simulator booted into).
+    pub fn kemu_gone(&self) {
+        self.kemu.store(false, Ordering::SeqCst);
+    }
+
+    /// Console input, any bytes. Over UART1 when kemu is there rather than
+    /// esp-emu's stdin, which hands a line over only once its newline
+    /// arrives - no use for a binary payload. A firmware without kemu (a
+    /// board image) reads esp-emu's stdin, its USB-Serial/JTAG.
     pub fn console_bytes(&self, data: &[u8]) {
+        if !self.kemu.load(Ordering::SeqCst) {
+            if let Some(tx) = &*self.stdin.lock().unwrap_or_else(PoisonError::into_inner) {
+                let _ = tx.send(data.to_vec());
+            }
+            return;
+        }
         for piece in data.chunks(CONSOLE_CHUNK) {
             self.to_kemu(proto::encode(proto::CONSOLE_IN, piece));
         }
@@ -484,6 +662,9 @@ impl Emu {
             }
         }
         self.wait().await;
+        if let Some(c5) = &self.c5 {
+            c5.stop().await;
+        }
     }
 }
 
@@ -502,7 +683,9 @@ mod tests {
             resets: AtomicU64::new(0),
             clock: OnceLock::new(),
             gone,
-            _stdin: Mutex::new(None),
+            stdin: Mutex::new(None),
+            kemu: std::sync::atomic::AtomicBool::new(false),
+            c5: None,
         }
     }
 

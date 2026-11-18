@@ -20,8 +20,6 @@
 #define KEMU_T_PANEL      0x11U  /* on u8, brightness u8 (0-100)             */
 #define KEMU_T_FB_PACKED  0x12U  /* x,y,w,h u16, then w*h RGB565 packed     */
                                  /* with kemu_pack16(); the Mac sees FB_RECT */
-#define KEMU_T_SD_READ    0x50U  /* lba u32, count u16, tag u16             */
-#define KEMU_T_SD_WRITE   0x51U  /* lba u32, count u16, then the blocks     */
 #define KEMU_T_USB_IN     0x60U  /* ep_addr u8, then what the device sent: one  */
                                  /* IN transfer, whole (an ack is zero bytes)   */
 #define KEMU_T_USB_DEV    0x61U  /* kind u8, a u8, b u16: what the device did  */
@@ -30,10 +28,6 @@
                                  /* the Mac may send that many more             */
 /* Mac -> firmware */
 #define KEMU_T_CONSOLE_IN 0x84U  /* raw console input (the USJ's RX)        */
-#define KEMU_T_RADIO      0x85U  /* c5 u8: 1 if the C5 comes up, 0 if not  */
-#define KEMU_T_SD_CARD    0x86U  /* sectors u32: the card in the slot, 0 none */
-#define KEMU_T_SD_DATA    0x87U  /* lba u32, count u16 (0: failed), the     */
-                                 /* read's tag u16, then the blocks          */
 #define KEMU_T_TIME       0x88U  /* unix_us u64: the Mac's clock, for the RTC */
 #define KEMU_T_USB_BUS    0x8AU  /* kind u8: 0 cable out, 1 cable in, 2 suspend, 3 resume, 4 reset */
 #define KEMU_T_USB_SETUP  0x8BU  /* the 8 bytes of a SETUP packet           */
@@ -58,9 +52,6 @@
 #define KEMU_T_BUTTONS    0x81U  /* mask u8: KEMU_BTN_*                      */
 #define KEMU_T_PCM_IN     0x82U  /* s16le at the last MIC_START rate         */
 #define KEMU_T_BATTERY    0x83U  /* percent u8, usb u8                       */
-
-/* SD_READ's payload, and SD_DATA's head before its blocks */
-#define KEMU_SD_HEAD 8U
 
 #define KEMU_BTN_TOP   (1U << 0)
 #define KEMU_BTN_BOT   (1U << 1)

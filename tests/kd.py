@@ -22,16 +22,11 @@ PCM_OUT = 0x30
 MIC_START = 0x31
 MIC_STOP = 0x32
 POWER_OFF = 0x40
-SD_READ = 0x50
-SD_WRITE = 0x51
 TOUCH = 0x80
 BUTTONS = 0x81
 PCM_IN = 0x82
 BATTERY = 0x83
 CONSOLE_IN = 0x84
-RADIO = 0x85
-SD_CARD = 0x86
-SD_DATA = 0x87
 TIME = 0x88
 MOTION = 0x8D
 USB_IN = 0x60
@@ -40,10 +35,6 @@ USB_ACK = 0x62
 USB_BUS = 0x8A
 USB_SETUP = 0x8B
 USB_OUT = 0x8C
-
-# SD_READ's payload, and SD_DATA's head before its blocks: lba u32, count
-# u16, the read's tag u16 (SD_WRITE's head is lba and count alone).
-SD_HEAD = struct.Struct("<IHH")
 
 BTN_TOP, BTN_BOT, BTN_LEFT, BTN_RIGHT, BTN_UP, BTN_DOWN = (1 << i for i in range(6))
 

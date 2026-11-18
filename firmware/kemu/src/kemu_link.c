@@ -24,8 +24,6 @@
 #include "kemu_clock.h"
 #include "kemu_console.h"
 #include "kemu_link.h"
-#include "kemu_radio.h"
-#include "kemu_sd.h"
 #include "kemu_usb.h"
 
 #define LINK_UART      UART_NUM_1
@@ -124,8 +122,6 @@ extern void __real_app_main(void);
 void __wrap_app_main(void)
 {
     kemu_console_start();
-    kemu_radio_start();
-    kemu_sd_start();
     kemu_usb_start();
     kemu_clock_start();
     kemu_link_start();

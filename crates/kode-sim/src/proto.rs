@@ -27,12 +27,6 @@ pub const MIC_START: u8 = 0x31;
 /// It is off.
 pub const MIC_STOP: u8 = 0x32;
 pub const POWER_OFF: u8 = 0x40;
-/// lba u32, count u16, tag u16: blocks the firmware wants from the card.
-/// The tag is the read's own, so an answer that comes after kemu gave up
-/// on the read is never taken into the next one.
-pub const SD_READ: u8 = 0x50;
-/// lba u32, count u16, then the blocks.
-pub const SD_WRITE: u8 = 0x51;
 pub const TOUCH: u8 = 0x80;
 pub const BUTTONS: u8 = 0x81;
 /// s16le at the last MIC_START's rate: the Mac's microphone, page to
@@ -41,13 +35,6 @@ pub const PCM_IN: u8 = 0x82;
 pub const BATTERY: u8 = 0x83;
 /// Raw console input: the board's USB-Serial/JTAG RX.
 pub const CONSOLE_IN: u8 = 0x84;
-/// u8: 1 if the C5 comes up (WiFi works), 0 if it never does.
-pub const RADIO: u8 = 0x85;
-/// sectors u32: the card in the slot, 0 for none.
-pub const SD_CARD: u8 = 0x86;
-/// lba u32, count u16 (0: the read failed), the read's tag u16, then the
-/// blocks ([`SD_DATA_MAX`] at most).
-pub const SD_DATA: u8 = 0x87;
 /// unix_us u64: the Mac's clock, for the P4's RTC.
 pub const TIME: u8 = 0x88;
 
@@ -70,12 +57,6 @@ pub const USB_BUS: u8 = 0x8A;
 pub const USB_SETUP: u8 = 0x8B;
 /// ep u8 (0-7), then one OUT chunk of up to 4096 bytes.
 pub const USB_OUT: u8 = 0x8C;
-
-pub const SD_BLOCK: usize = 512;
-/// SD_READ's payload, and SD_DATA's head before its blocks.
-pub const SD_HEAD: usize = 8;
-/// Blocks per SD_DATA frame: kemu's link frames are 8 KB.
-pub const SD_DATA_MAX: usize = 15;
 
 /// One frame, header and all.
 pub fn encode(type_: u8, payload: &[u8]) -> Vec<u8> {

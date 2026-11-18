@@ -101,9 +101,10 @@ pub async fn run(a: Args) -> i32 {
             forwards: a.forwards.clone(),
             restrict: a.restrict,
             save_state: a.save_state,
+            sd: None,
+            wifi: a.wifi,
         },
         http_port: port,
-        wifi: a.wifi,
         sd: Some(a.sd.clone()),
         sd_in: a.sd_in,
     });

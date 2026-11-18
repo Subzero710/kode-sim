@@ -1,7 +1,8 @@
 //! The Kode Dot's chips beside an esp-emu, over `--cosim-tcp`: one device
 //! that answers the board's seven I2C addresses, drives the pins they drive
 //! on the P4 (the expander's INT, TOP) and is the ES8311's audio side on the
-//! I2S data pads, so unchanged firmware finds the board it was built for.
+//! I2S data pads, and the AMOLED on the MIPI-DSI link, so unchanged firmware
+//! finds the board it was built for.
 
 use std::io;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
@@ -12,6 +13,7 @@ use cosim::{gpio_drive, i2c_reply, i2s_in, register, Claim, Client, Payload};
 use kodedot_chips::{Battery, Board, Event, Motion, PIN_BUTTON_TOP, PIN_IOEXP_INT};
 
 use crate::audio::Codec;
+use crate::panel::{Panel, Shown};
 
 /// The board's I2C pads (kbsp_pins.h).
 const SDA: u8 = 4;
@@ -33,6 +35,10 @@ pub enum Out {
     Sound(Vec<u8>),
     /// The microphone's rate, once the firmware started the receiver at it.
     MicRate(u32),
+    /// What the panel shows: a band of the picture, or its state.
+    Screen(Shown),
+    /// The chip reset: the firmware boots again (kemu or not).
+    Reset,
 }
 
 /// What happens outside the bus, for whoever shows it (a page, a log).
@@ -51,6 +57,7 @@ struct Shared {
     /// the firmware sets it.
     gain: AtomicI32,
     codec: Mutex<Codec>,
+    panel: Mutex<Panel>,
 }
 
 impl Shared {
@@ -102,6 +109,7 @@ impl Chips {
             vec![Claim::Gpio { drive: (1 << PIN_IOEXP_INT) | (1 << PIN_BUTTON_TOP) | (1 << PIN_NFC_IRQ), watch: 0 }];
         claims.extend(board.addrs().into_iter().map(|addr| Claim::I2c { addr, scl: SCL, sda: SDA }));
         claims.push(Claim::I2s { dout: Some(PIN_I2S_DOUT), din: Some(PIN_I2S_DIN) });
+        claims.push(Claim::Dsi { vc: 0 });
         client.send(&register("kodedot", &claims))?;
         client.send(&gpio_drive(0, PIN_NFC_IRQ, false))?;
         client.send(&gpio_drive(0, PIN_BUTTON_TOP, true))?;
@@ -128,6 +136,7 @@ impl Chips {
             sink: Mutex::new(sink),
             gain: AtomicI32::new(0),
             codec: Mutex::new(Codec::new()),
+            panel: Mutex::new(Panel::default()),
         });
         // The pins the chips drive from power-on (the expander's INT at rest).
         shared.flush(&mut shared.board())?;
@@ -153,7 +162,18 @@ impl Chips {
                 }
                 // The board did not reset, nor do its chips; the codec's
                 // queues belong to the old timeline.
-                Payload::ChipReset { .. } => self.shared.codec().reset(now),
+                // The panel did not reset either: it keeps its picture, and
+                // whether it is lit, as kodeOS's restart relies on.
+                Payload::ChipReset { .. } => {
+                    self.shared.codec().reset(now);
+                    (self.shared.sink.lock().unwrap_or_else(PoisonError::into_inner))(Out::Reset);
+                }
+                Payload::Dsi(e) => {
+                    let shown = self.shared.panel.lock().unwrap_or_else(PoisonError::into_inner).event(e);
+                    if let Some(s) = shown {
+                        (self.shared.sink.lock().unwrap_or_else(PoisonError::into_inner))(Out::Screen(s));
+                    }
+                }
                 Payload::I2sFormat(f) => {
                     if let Some(rate) = self.shared.codec().format(f, now) {
                         (self.shared.sink.lock().unwrap_or_else(PoisonError::into_inner))(Out::MicRate(rate));

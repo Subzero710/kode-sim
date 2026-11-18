@@ -5,9 +5,7 @@ input arrives as CONSOLE_IN frames, as kemu takes it: "crash" dies like a
 panic, "spam N" prints N long lines, "reboot" boots again as a panic's reboot does, "cut N" sends the
 start of an FB_PACKED that promises N bytes and never ends (what a reset
 leaves on the wire), "poweroff" sends POWER_OFF, "flood N" sends N whole-screen FB_RECTs,
-"count N" takes the next N raw bytes and reports their CRC, "sdread LBA N
-[TAG]" and "sdwrite LBA N BYTE" ask the Mac for card blocks as kemu does
-(SD_DATA comes back printed as "sddata LBA N CRC tag TAG"), "ping" and
+"count N" takes the next N raw bytes and reports their CRC, "ping" and
 'install src="terminal" dst=app size= crc32= run= [name=]' answer as KodeOS does (the
 ready behind a prompt and its erase, an ack per chunk, the CRC checked;
 FAKE_INSTALL_REFUSE makes it refuse, $FAKE_INSTALL_SLOW seconds of erase
@@ -40,6 +38,13 @@ write-region with $FAKE_WRITE_REGION_ERR and reset with $FAKE_RESET_ERR;
 write-region takes $FAKE_WRITE_REGION_SLOW seconds. Like
 kodeOS, a boot that finds an app image in app_pending adopts it ("... adopted
 from the mailbox") and boots it.
+With --chip esp32c5 it is the C5 instead: it listens on the socket its
+--hosted bridge:slave:PATH names (as esp-emu's slave does, for the P4 to
+connect to), prints "fake c5: up" and waits to be stopped; its launches
+are lines in $FAKE_LAUNCH_LOG.c5.
+With $FAKE_BOARD_IMAGE it is a firmware built for the board: no kemu, so no
+HELLO and nothing on UART1; each line on its stdin (the USB-Serial/JTAG
+console) is printed back as "stdin: LINE".
 Each launch appends a line to $FAKE_LAUNCH_LOG. It exits once UART1's
 client has gone, unless $FAKE_OUTLIVE_UART (then it runs on, as esp-emu
 does, until it is stopped).
@@ -55,12 +60,25 @@ from pathlib import Path
 import kd
 
 
+async def c5(args) -> int:
+    """The C5's esp-emu: its SDIO socket open, nothing on it."""
+    path = args[args.index("--hosted") + 1].removeprefix("bridge:slave:")
+    server = await asyncio.start_unix_server(lambda r, w: None, path)
+    print("fake c5: up", flush=True)
+    async with server:
+        await asyncio.sleep(3600)
+    return 0
+
+
 async def main() -> int:
     args = sys.argv[1:]
-    host, port = args[args.index("--uart1-tcp") + 1].rsplit(":", 1)
+    c5_too = args[args.index("--chip") + 1] == "esp32c5"
     if os.environ.get("FAKE_LAUNCH_LOG"):
-        with open(os.environ["FAKE_LAUNCH_LOG"], "a") as f:
+        with open(os.environ["FAKE_LAUNCH_LOG"] + (".c5" if c5_too else ""), "a") as f:
             f.write(" ".join(args) + "\n")
+    if c5_too:
+        return await c5(args)
+    host, port = args[args.index("--uart1-tcp") + 1].rsplit(":", 1)
     conn: asyncio.Future = asyncio.get_running_loop().create_future()
 
     async def on_client(reader, writer):
@@ -115,9 +133,19 @@ async def main() -> int:
             print(f"!N 4431 kaos.appmgr dev app '{app_name}' v1 adopted from the mailbox", flush=True)
             mode[0] = app_name
         print(f"I (629) app_init: Project name:     {mode[0]}", flush=True)
+        if os.environ.get("FAKE_BOARD_IMAGE"):
+            return
+        _, boot_writer = await conn
         boot_writer.write(kd.encode(kd.HELLO, struct.pack("<HHH", 1, 410, 502)))
         boot_writer.write(kd.encode(kd.FB_RECT, struct.pack("<HHHH", 0, 0, 2, 2) + b"\xff\xff" * 4))
         await boot_writer.drain()
+
+    if os.environ.get("FAKE_BOARD_IMAGE"):
+        async def board_console():
+            # A board image's console is its USB-Serial/JTAG: esp-emu's stdin.
+            while line := await asyncio.to_thread(sys.stdin.readline):
+                print(f"stdin: {line.rstrip()}", flush=True)
+        asyncio.get_running_loop().create_task(board_console())
 
     if "--control-tcp" in args:
         chost, cport = args[args.index("--control-tcp") + 1].rsplit(":", 1)
@@ -380,12 +408,7 @@ async def main() -> int:
                 elif t == kd.USB_OUT:
                     pass
                 else:
-                    if t == kd.SD_DATA:
-                        lba, n, tag = kd.SD_HEAD.unpack_from(p)
-                        print(f"sddata {lba} {n} {zlib.crc32(p[kd.SD_HEAD.size:])} tag {tag}", flush=True)
-                    else:
-                        print(f"rx {t} {len(p)}" + (f" {p.hex()}" if t in (kd.RADIO, kd.SD_CARD, kd.TIME) else ""),
-                              flush=True)
+                    print(f"rx {t} {len(p)}" + (f" {p.hex()}" if t == kd.TIME else ""), flush=True)
         console.put_nowait(None)
 
     asyncio.create_task(uart())
@@ -493,15 +516,6 @@ async def main() -> int:
                 run_after = f.get("run") == "on"
                 pending = b""          # residue before the ready, as kodeOS drains it
                 break
-            elif line.startswith("sdread "):                 # as kemu asks for blocks
-                lba, n, *tag = (int(x) for x in line.split()[1:4])
-                writer.write(kd.encode(kd.SD_READ, kd.SD_HEAD.pack(lba, n, tag[0] if tag else 1)))
-                await writer.drain()
-            elif line.startswith("sdwrite "):                # LBA N BYTE
-                lba, n, byte = (int(x) for x in line.split()[1:4])
-                writer.write(kd.encode(kd.SD_WRITE, struct.pack("<IH", lba, n) + bytes([byte]) * (512 * n)))
-                await writer.drain()
-                print("sdwritten", flush=True)
             elif line.startswith("i2cw "):                   # ADDR REG BYTE..., hex
                 addr, reg, *data = (int(x, 16) for x in line.split()[1:])
 

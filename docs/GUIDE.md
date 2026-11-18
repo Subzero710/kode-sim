@@ -8,10 +8,15 @@ Everything the [README](../README.md) leaves out: how the simulator is put toget
  ┌──────────────── esp-emu (ESP32-P4) ──────────────┐            ┌────────── kode-sim (Rust) ─────────┐
  │ your app / kodeOS        (unchanged)             │            │ the board's chips (kodedot-chips)  │
  │ kode.h → Active Objects → kdrv (unchanged)       │ cosim-tcp  │  TCA6408A, CST820, KTD2026,        │
- │ I2C, GPIO, I2S ──────────────────────────────────┼────────────┤  AW86233, BQ25896, CW2217, ES8311  │
- │ kemu: panel, microSD, C5, console ───────────────┼── UART1 ───┤ bridge: screen/LED/state, /ws ↔   │
- │       (what esp-emu does not have yet)           │            │  the page, the serial port, the SD │
- └──────────────────────────────────────────────────┘            └────────────────────────────────────┘
+ │ I2C, GPIO, I2S, MIPI-DSI ────────────────────────┼────────────┤  AW86233, BQ25896, CW2217, ES8311, │
+ │ SDMMC slot 0 ── --sd card.img                    │            │  the AMOLED (CO5300)               │
+ │ SDMMC slot 1 ── --hosted ──┐                     │            │                                    │
+ │ kemu: USB port, console ───┼─────────────────────┼── UART1 ───┤ bridge: screen/LED/state, /ws ↔   │
+ └────────────────────────────┼─────────────────────┘            │  the page, the serial port         │
+ ┌─ esp-emu (ESP32-C5) ───────┴─────────────────────┐            └────────────────────────────────────┘
+ │ kode_slave_c5 (Kode's C5 firmware): WiFi, BLE    │
+ │ --net user: esp-emu's soft AP "kode-sim" → Mac   │
+ └──────────────────────────────────────────────────┘
 ```
 
 The board's chips are esp-emu's virtual parts: kode-sim answers the P4's
@@ -26,12 +31,23 @@ reaches the Mac's speaker and the Mac's microphone reaches the firmware's
 recordings, under the stock I2S driver. Chips that are not simulated (the NFC
 reader) do not answer, so the drivers see them absent, as on a board without them.
 
-What esp-emu cannot do yet - the MIPI-DSI panel, the SDMMC card, the
-ESP32-C5 - `kemu` does inside the firmware, linked in by `kode-sim build`
-(`-Wl,--wrap=` of the few calls the drivers make), and sends to the Mac as
-frames over UART1. Each part esp-emu gains leaves kemu; when kemu is empty,
-any board binary runs as it is (`kode-sim build --board` builds that one
-already: the chips work, the screen does not).
+The rest is esp-emu's too, since 1.1.0. The AMOLED is the panel on the P4's
+MIPI-DSI link: the firmware's own `esp_lcd` DSI bus, DBI commands and DPI
+panel run, and kode-sim takes the rows of each frame that changed, and the
+DCS commands that light it, dim it and put it to sleep, over `--cosim-tcp`.
+The microSD is esp-emu's SDMMC host with a card image in slot 0 (`--sd`).
+The ESP32-C5 is a second esp-emu running Kode's own C5 firmware,
+[kode_slave_c5](https://github.com/kodediy/kode_slave_c5), bridged to the
+P4's SDIO slot 1 (`--hosted`): the real ESP-Hosted link, with the WiFi, the
+BLE and the vault on the C5, as on the board.
+
+What esp-emu cannot do yet - the USB-OTG port with a computer on its cable -
+`kemu` does inside the firmware, linked in by `kode-sim build`
+(`-Wl,--wrap=` of the few calls the drivers make), with the console and the
+RTC's time, and sends to the Mac as frames over UART1. A board binary - one
+built with `kode-sim build --board`, kodeOS's own release, an app from
+apps.kode.diy - runs as it is: the screen, the card, the WiFi and BLE work;
+only the USB port's computer is kemu's alone (see [Board images](#board-images)).
 
 `kode-sim` never touches the project: it copies it to
 `~/Library/Caches/kode-sim/<name>-<hash>/src`, adds one `include()` before the
@@ -60,10 +76,13 @@ configures nor solves its dependencies again.
    The binary uses the page (`web/`) and kemu (`firmware/`) of the checkout
    it was built from, so keep the checkout where it is
    (`$KODE_SIM_WEB` and `$KODE_SIM_FIRMWARE` point elsewhere).
-3. `esp-emu` **1.0.0** - installed by kode-sim on its first run, with
-   Espressif's installer, into `~/Library/Caches/kode-sim/esp-emu-1.0.0`
+3. `esp-emu` **1.1.0** - installed by kode-sim on its first run, with
+   Espressif's installer, into `~/Library/Caches/kode-sim/esp-emu-1.1.0`
    (`$KODE_SIM_TOOLS` moves that folder; an `esp-emu` on PATH is left alone;
-   `KODE_SIM_ESP_EMU` names another binary to run instead).
+   `KODE_SIM_ESP_EMU` names another binary to run instead). Beside it, on the
+   first run too, the C5's firmware: kode_slave_c5, fetched from GitHub and
+   built with your ESP-IDF into `kode_c5-<version>` in the same folder
+   (`$KODE_SIM_C5` names another image instead).
 
 kode-sim is made for the Mac (Apple silicon). Its host suites also run on
 Linux, where the cache is `$XDG_CACHE_HOME/kode-sim` (or
@@ -121,27 +140,43 @@ nobody has used it for a while.
 
 ## WiFi and the network
 
-An app that asks for WiFi (`wifi_start_request()`) gets it, and hears what
-it hears on a board that joined its network: RADIO_STATE_SIG `KRADIO_UP`,
-then WIFI_STATE_SIG `GOT_IP` with its address, on a network called
-`kode-sim` (RSSI -50). Its lwIP sockets work: outbound to the Mac and the
-internet, and inbound on the ports `--forward` opens -
+The Kode Dot's radio is its ESP32-C5, and kode-sim runs one: a second
+esp-emu with Kode's C5 firmware, kode_slave_c5 at the release kode-sim pins
+(built from source the first time, into kode-sim's cache: esp-emu needs its
+ELF). The P4 reaches it over the SDIO link as on the board, through
+esp-hosted, so everything above is the board's own: AO_Radio brings the link
+up, kdrv_wifi scans and joins, the vault keeps the networks on the C5, BLE
+advertises through NimBLE on the P4 and the C5's controller.
+
+The C5 sees one network, esp-emu's soft AP: **`kode-sim`**, open (no
+password), on channel 1. The C5's vault starts blank, as a new board's
+does, so the first time the radio comes up with no network kode-sim joins
+it for you, typing `wifi_join ssid="kode-sim"` at the console, and the C5
+saves it in its vault like any other. An app built without the console
+cannot be joined that way: join it from a kodeOS with `--save-state`, whose
+C5 keeps the network for the runs after. Behind it is esp-emu's user-mode network: DHCP gives
+192.168.4.2, the gateway 192.168.4.1 is the Mac, and the Kode Dot's sockets
+reach the Mac and the internet. Inbound, only the ports `--forward` opens:
 `--forward 25565` makes `127.0.0.1:25565` on the Mac reach the Kode Dot's
 25565, `--forward 8080:80` the Kode Dot's 80; repeatable.
 
-Under the hood it is not WiFi: the board's WiFi is the ESP32-C5's, over
-ESP-Hosted, and esp-emu cannot run that C5. kemu brings up the P4's own
-Ethernet (esp-emu models its EMAC and an IP101), which esp-emu's user-mode
-network serves: DHCP gives 192.168.4.2, the gateway 192.168.4.1 is the Mac,
-and only forwarded ports reach in. Only the four requests an app makes
-first are there (`radio_state`, `wifi_start`, `wifi_state`, `wifi_fast`);
-scans, joins, the vault and BLE are not. `--no-wifi` is the board whose C5
-never comes up: `KRADIO_FAILED` and no address. `--no-internet` keeps the
-address but lets nothing out except DNS.
+`--no-wifi` is the board whose C5 never comes up: no C5 runs, the P4's SDIO
+link finds no card, and the radio fails as it does on the board.
+`--no-internet` keeps the network but lets nothing out except DNS.
+`--save-state` keeps the C5's flash too (its vault: the networks it joined),
+in `~/Library/Caches/kode-sim/c5/flash.bin`; without it every run starts
+with a C5 that has joined nothing. The C5's own console goes to
+`~/Library/Caches/kode-sim/c5.log`. `$KODE_SIM_C5` names a folder with
+another C5 image (`merged-binary.bin` and `kode_c5.elf`).
 
-kodeOS boots with the clock set from the Mac's (kode-sim sets the P4's RTC
-at every boot, as an RTC that kept its supply), so a Kode Dot with no
-network is not stuck at "Set the time".
+What the C5 does not have in esp-emu: its 32 kHz crystal (it says so at
+boot and runs on its internal clock), the infrared, and the Kode cloud's
+identity (a C5 that was never provisioned: "no identity in the C5").
+
+A firmware built for the simulator boots with the clock set from the Mac's
+(kemu sets the P4's RTC at every boot, as an RTC that kept its supply), so a
+Kode Dot with no network is not stuck at "Set the time". A board image has
+no kemu: it sets its clock as a board does, from the network.
 
 ## The microSD
 
@@ -149,21 +184,50 @@ The slot holds a card: a card image on the Mac, by default
 `~/Library/Caches/kode-sim/sd/card.img` (1 GB, made on the first run as a
 Mac formats a card - MBR, one FAT32 volume called KODEDOT; sparse, so it
 takes a few MB). `--sd my-card.img` uses another, making it if it is not
-there; `--no-sd` starts with the slot empty, and the page's **SD insertada**
-takes the card out and puts it back.
+there; `--no-sd` starts with the slot empty.
 A card image is in one simulator at a time: a second `kode-sim run` on the
 same image stops and says so (give it `--sd OTHER.img`).
 
-kemu answers ESP-IDF's SDMMC host as an SDHC card would (CSD 2.0, SD 3.0,
-4-bit, high speed) and gets its blocks from the image over UART1, so
-everything above it is the board's own: khal_sdmmc's mount, FATFS, kdrv_sd,
-AO_Storage. As AO_Radio does on the board, the radio has the card mounted
-before it says the link is up or failed.
+The card is esp-emu's: its SDMMC host has the image in slot 0, the Kode
+Dot's slot, and the firmware's own driver mounts it, 4-bit at 40 MHz, as
+on the board - khal_sdmmc, FATFS, kdrv_sd, AO_Storage. esp-emu takes no
+card in or out while it runs, so the page's **SD insertada** restarts the
+Kode Dot with the slot as it now is, as one would with the card pulled under
+it.
 
 To look at the card from the Mac, with the simulator stopped:
 `diskutil image attach --readOnly ~/Library/Caches/kode-sim/sd/card.img`
 (and `diskutil eject` it afterwards). Not while it runs: two writers on one
 FAT break it. Files kodeOS writes before its clock is set are dated 1980.
+
+## Board images
+
+A binary built for the board runs as it is: `kode-sim build --board`'s, a
+KodeOS release, an app from apps.kode.diy. `kode-sim run --firmware
+MERGED.bin` boots one (`--elf` is optional). A KodeOS factory pack is six
+files at their offsets; merge them into one image first, as `flash.sh` would
+write them:
+
+```bash
+python -m esptool --chip esp32p4 merge-bin --pad-to-size 32MB -o kodeos.bin \
+  0x2000 bootloader.bin 0x8000 partition-table.bin 0x1B000 ota_data_initial.bin \
+  0x20000 kodeos.bin 0xC40000 apps.bin 0x1800000 storage.bin
+kode-sim run --firmware kodeos.bin
+```
+
+Known issue, in a build for the simulator too: once kodeOS has adopted an
+app from the mailbox, esp-emu 1.1.0's DMA refuses the screen's frame buffer
+("is not in memory", "frame underrun") and the screen is lost. Install
+through the console where you can.
+
+Without kemu in it, the console is the firmware's USB-Serial/JTAG through
+esp-emu (the terminal and the page reach it a line at a time, so an install
+through the console, whose chunks are raw bytes, does not go through, and
+the mailbox has the known issue above), its clock
+starts unset until the network sets it, and the USB port has no computer on
+its cable: esp-emu's USB-OTG controller is there, but only a CDC console
+answers on it, not the page's "Ordenador (USB)"
+([esp-emulator#51](https://github.com/espressif/esp-emulator/issues/51)).
 
 ## Installing apps
 
@@ -343,7 +407,7 @@ regression tests](USB.md) for the emulation boundary and validation.
 | Part | State |
 |---|---|
 | ESP32-P4, PSRAM 32 MB, flash 32 MB | esp-emu |
-| Panel 410×502, brightness, on/off | ✓ |
+| Panel 410×502 (MIPI-DSI), brightness, on/off | ✓ esp-emu's DSI host, the firmware's own `esp_lcd` |
 | Touch (CST820 via the expander's P6) | ✓ |
 | Six buttons (GPIO35 + TCA6408A) | ✓ |
 | RGB LED (KTD2026) | ✓ |
@@ -351,9 +415,12 @@ regression tests](USB.md) for the emulation boundary and validation.
 | Speaker / microphone (ES8311) | ✓ through the Mac, on esp-emu's I2S; the Mac's microphone with "Micrófono del Mac" |
 | Charger + gauge, ship mode | ✓ slider and USB switch |
 | Storage (FAT on flash) | ✓ within one run |
-| microSD | ✓ a card image on the Mac, kept across runs; "SD insertada" on the page |
-| WiFi (the C5's) | ✓ as a network: the P4's emulated Ethernet behind the radio's signals, `--forward` for inbound ports |
-| ESP32-C5 itself: BLE, IR, scans and joins, SD power | ✗ |
+| microSD | ✓ esp-emu's SDMMC, a card image on the Mac kept across runs; "SD insertada" on the page restarts with the slot changed |
+| ESP32-C5: WiFi, scans and joins, the vault | ✓ Kode's C5 firmware in a second esp-emu, over ESP-Hosted; one open network, `kode-sim`, joined for you the first time; `--forward` for inbound ports |
+| ESP32-C5: BLE | ~ it comes up and advertises; nothing on the Mac connects to it yet |
+| The C5's infrared, its 32 kHz crystal | ✗ |
+| JPEG and PPA | ~ esp-emu's (not decoding to YUV); not yet tried by kode-sim's tests |
+| Light sleep | ✗ not in esp-emu 1.1.0 |
 | IMU (QMI8658A), magnetometer (QMC5883P) | ✓ the page poses the board (pitch, roll, heading), shakes it and brings a magnet near; the chips answer in the scales the driver asked for (below) |
 | NFC, 125 kHz RFID | ✗ absent |
 | Console (USB-Serial/JTAG) | ✓ the terminal, the page and a serial port for kcli.py |
