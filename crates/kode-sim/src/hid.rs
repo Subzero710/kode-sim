@@ -146,6 +146,21 @@ impl Field {
     fn relative(&self) -> bool {
         self.flags & 4 != 0
     }
+
+    fn usages(&self) -> impl Iterator<Item = (Usage, Usage)> + '_ {
+        let mut remaining = if self.globals.count == 0 {
+            0
+        } else if self.variable() {
+            u64::from(self.globals.count)
+        } else {
+            (self.globals.logical_max - self.globals.logical_min + 1) as u64
+        };
+        self.locals.usages.iter().filter_map(move |(first, last)| {
+            let used = remaining.min(u64::from(last.id - first.id) + 1);
+            remaining -= used;
+            (used > 0).then(|| (*first, Usage { page: first.page, id: (u64::from(first.id) + used - 1) as u16 }))
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -418,7 +433,7 @@ impl Descriptor {
                     !f.constant()
                         && f.globals.count > 0
                         && f.application.is_some_and(|a| self.collections[a].keyboard())
-                        && f.locals.usages.iter().any(|(u, _)| u.page == PAGE_KEYBOARD)
+                        && f.usages().any(|(u, _)| u.page == PAGE_KEYBOARD)
                 })
         })
     }
@@ -430,9 +445,11 @@ impl Descriptor {
                     !f.constant()
                         && f.globals.count > 0
                         && f.application.is_some_and(|a| self.collections[a].mouse())
-                        && f.locals.usages.iter().any(|(u, _)| {
-                            u.page == PAGE_BUTTON
-                                || (u.page == PAGE_DESKTOP && matches!(u.id, USAGE_X | USAGE_Y | USAGE_WHEEL))
+                        && f.usages().any(|(first, last)| {
+                            first.page == PAGE_BUTTON
+                                || (first.page == PAGE_DESKTOP
+                                    && ((first.id <= USAGE_Y && last.id >= USAGE_X)
+                                        || (first.id <= USAGE_WHEEL && last.id >= USAGE_WHEEL)))
                         })
                 })
         })
@@ -451,24 +468,9 @@ impl Descriptor {
                 {
                     continue;
                 }
-                let limit = if field.variable() {
-                    u64::from(field.globals.count)
-                } else {
-                    (field.globals.logical_max - field.globals.logical_min + 1) as u64
-                };
-                let mut position = 0;
-                for (first, last) in &field.locals.usages {
-                    let count = u64::from(last.id - first.id) + 1;
-                    let used = limit.saturating_sub(position).min(count);
-                    if first.page == PAGE_BUTTON && used > 0 {
-                        let end = (u64::from(first.id) + used - 1) as u16;
-                        if end > 0 {
-                            ranges.push((first.id.max(1), end));
-                        }
-                    }
-                    position += count;
-                    if position >= limit {
-                        break;
+                for (first, last) in field.usages() {
+                    if first.page == PAGE_BUTTON && last.id > 0 {
+                        ranges.push((first.id.max(1), last.id));
                     }
                 }
             }
@@ -511,7 +513,7 @@ impl Descriptor {
             }
             let application = field.application.map(|app| (app, &self.collections[app]));
             let relevant = application.is_some_and(|(_, collection)| {
-                field.locals.usages.iter().any(|(first, last)| {
+                field.usages().any(|(first, last)| {
                     (collection.keyboard() && first.page == PAGE_KEYBOARD)
                         || (collection.mouse()
                             && (first.page == PAGE_BUTTON
@@ -875,6 +877,42 @@ mod tests {
         assert_eq!(i.collections[0].mouse.as_ref().unwrap().relative[&USAGE_X], 1);
         let unknown = Descriptor::parse(&hex("05 01 09 05 a1 01 09 30 15 00 25 01 75 08 95 01 81 02 c0")).unwrap();
         assert!(unknown.input(&[1]).is_err());
+    }
+
+    #[test]
+    fn supported_axes_inside_a_larger_usage_range_advertise_mouse_input() {
+        let d = Descriptor::parse(&hex("05 01 09 02 a1 01 19 32 29 38 15 81 25 7f
+            75 08 95 07 81 06 c0"))
+        .unwrap();
+        assert!(d.mouse());
+        assert!(!d.keyboard());
+        assert!(!d.diagnostics.is_empty());
+        assert_eq!(mouse_report(&d, &[0, 0, 0, 0, 0, 0, 1]).relative, BTreeMap::from([(USAGE_WHEEL, 1)]));
+    }
+
+    #[test]
+    fn usages_beyond_the_field_count_or_array_range_do_not_claim_input_support() {
+        for encoding in ["75 08 95 01 81 06", "75 08 95 01 15 00 25 00 81 00"] {
+            let d =
+                Descriptor::parse(&hex(&format!("05 01 09 02 a1 01 19 32 29 38 15 81 25 7f {encoding} c0"))).unwrap();
+            assert!(!d.mouse());
+            assert!(d.input(&[0]).is_err());
+        }
+        let d = Descriptor::parse(&hex("05 01 09 06 a1 01 0b 01 00 00 ff 0b 04 00 07 00
+            15 00 25 01 75 01 95 01 81 02 75 07 95 01 81 01 c0"))
+        .unwrap();
+        assert!(!d.keyboard());
+        assert!(d.input(&[0]).is_err());
+    }
+
+    #[test]
+    fn unsigned_32_bit_axes_keep_their_full_range() {
+        let d = Descriptor::parse(&hex("05 01 09 02 a1 01 09 30 15 00 27 ff ff ff ff
+            75 20 95 01 81 02 c0"))
+        .unwrap();
+        let m = mouse_report(&d, &u32::MAX.to_le_bytes());
+        assert_eq!(m.absolute[&USAGE_X], i64::from(u32::MAX));
+        assert!(m.relative.is_empty());
     }
 
     #[test]

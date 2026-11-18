@@ -13,5 +13,7 @@ menu "USB lifecycle regression fixture"
             bool "Keyboard and mouse on separate interfaces"
         config USB_TEST_SHARED
             bool "Keyboard and mouse collections with distinct Report IDs"
+        config USB_TEST_MSC
+            bool "Shared HID interface and ESP-TinyUSB SPI flash storage"
     endchoice
 endmenu

@@ -52,7 +52,6 @@ const CHUNK: usize = 4096;
 /// emulated P4 is slow, and a SCSI command may sit in the card for seconds.
 const CONTROL_WAIT: Duration = Duration::from_secs(10);
 const BULK_WAIT: Duration = Duration::from_secs(30);
-const SECTOR: usize = 512;
 /// Sectors one SCSI command moves at most.
 const MAX_SECTORS: usize = 128;
 /// The lines of the host's log kept for the page.
@@ -487,7 +486,9 @@ impl Host {
                     self.closed_hid_endpoints.insert(ep);
                 }
                 self.hid_states.retain(|(_, source_ep, _, _), _| ep != 0xff && *source_ep != ep);
-                self.dead.clear();
+                self.dead.retain(|(interface, collection), _| {
+                    self.hid_states.keys().any(|(i, _, _, c)| i == interface && c == collection)
+                });
                 self.pending_hid.retain(|(source_ep, _)| ep != 0xff && *source_ep != ep);
                 self.ins.retain(|source_ep, _| ep != 0xff && *source_ep != ep);
                 self.publish(true);
@@ -1433,8 +1434,8 @@ impl Host {
             bs,
             (self.disk.blocks * bs as u64) >> 20
         ));
-        if bs as usize != SECTOR {
-            return Err(UsbErr::Protocol(format!("blocks of {bs} bytes: only 512 is mounted")));
+        if !(512..=4096).contains(&bs) || !bs.is_power_of_two() {
+            return Err(UsbErr::Protocol(format!("unsupported FAT logical block size {bs}")));
         }
         // MODE SENSE(6): bit 7 of the device-specific parameter is write protect.
         if let Ok(ms) = self.bot(&[0x1A, 0, 0x3F, 0, 192, 0], 192, true, &[]) {
@@ -1798,6 +1799,7 @@ struct ScsiDisk<'a> {
     pos: u64,
     cache: BTreeMap<u64, (Vec<u8>, bool)>,
     len: u64,
+    sector_size: usize,
     /// The MBR partition's first sector, 0 when the disk is one volume.
     offset: u64,
 }
@@ -1808,22 +1810,29 @@ const WINDOWS: usize = 256;
 
 impl<'a> ScsiDisk<'a> {
     fn open(host: &'a mut Host) -> Result<ScsiDisk<'a>, UsbErr> {
-        let len = host.disk.blocks * SECTOR as u64;
-        let mut d = ScsiDisk { host, pos: 0, cache: BTreeMap::new(), len, offset: 0 };
+        let sector_size = host.disk.block_size as usize;
+        let len = host.disk.blocks * sector_size as u64;
+        let mut d = ScsiDisk { host, pos: 0, cache: BTreeMap::new(), len, sector_size, offset: 0 };
         let mbr = d.read_sectors(0, 1)?;
         d.offset = partition_start(&mbr);
+        if d.offset >= d.host.disk.blocks {
+            return Err(UsbErr::Protocol("partition starts outside the device".into()));
+        }
         Ok(d)
     }
 
     fn read_sectors(&mut self, lba: u64, count: usize) -> Result<Vec<u8>, UsbErr> {
-        let mut out = Vec::with_capacity(count * SECTOR);
+        let mut out = Vec::with_capacity(count * self.sector_size);
         let mut at = lba;
         let mut left = count;
         while left > 0 {
             let n = left.min(MAX_SECTORS);
             let cb =
                 [0x28, 0, (at >> 24) as u8, (at >> 16) as u8, (at >> 8) as u8, at as u8, 0, (n >> 8) as u8, n as u8, 0];
-            let d = self.host.bot(&cb, n * SECTOR, true, &[])?;
+            let d = self.host.bot(&cb, n * self.sector_size, true, &[])?;
+            if d.len() != n * self.sector_size {
+                return Err(UsbErr::Protocol("short SCSI block read".into()));
+            }
             self.host.read += d.len() as u64;
             out.extend_from_slice(&d);
             at += n as u64;
@@ -1833,9 +1842,12 @@ impl<'a> ScsiDisk<'a> {
     }
 
     fn write_sectors(&mut self, lba: u64, data: &[u8]) -> Result<(), UsbErr> {
+        if !data.len().is_multiple_of(self.sector_size) {
+            return Err(UsbErr::Protocol("unaligned SCSI block write".into()));
+        }
         let mut at = lba;
-        for part in data.chunks(MAX_SECTORS * SECTOR) {
-            let n = part.len() / SECTOR;
+        for part in data.chunks(MAX_SECTORS * self.sector_size) {
+            let n = part.len() / self.sector_size;
             let cb =
                 [0x2A, 0, (at >> 24) as u8, (at >> 16) as u8, (at >> 8) as u8, at as u8, 0, (n >> 8) as u8, n as u8, 0];
             self.host.bot(&cb, part.len(), false, part)?;
@@ -1853,7 +1865,9 @@ impl<'a> ScsiDisk<'a> {
             let start = dirty[i];
             let mut data = self.cache[&start].0.clone();
             let mut j = i + 1;
-            while j < dirty.len() && dirty[j] * SECTOR as u64 == start * SECTOR as u64 + data.len() as u64 {
+            while j < dirty.len()
+                && dirty[j] * self.sector_size as u64 == start * self.sector_size as u64 + data.len() as u64
+            {
                 data.extend_from_slice(&self.cache[&dirty[j]].0);
                 j += 1;
             }
@@ -1878,7 +1892,7 @@ impl<'a> ScsiDisk<'a> {
             self.flush_all()?;
             self.cache.clear();
         }
-        let count = WINDOW.min((self.len / SECTOR as u64 - base) as usize);
+        let count = WINDOW.min((self.len / self.sector_size as u64 - base) as usize);
         let data = self.read_sectors(base, count)?;
         self.cache.insert(base, (data, false));
         Ok(base)
@@ -1887,23 +1901,23 @@ impl<'a> ScsiDisk<'a> {
 
 impl Read for ScsiDisk<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let abs = self.pos + self.offset * SECTOR as u64;
+        let abs = self.pos + self.offset * self.sector_size as u64;
         if abs >= self.len || buf.is_empty() {
             return Ok(0);
         }
         let n = buf.len().min((self.len - abs) as usize);
         // Whole windows in bulk, straight to the buffer.
-        if abs.is_multiple_of((WINDOW * SECTOR) as u64) && n >= WINDOW * SECTOR {
-            let sectors = n / SECTOR / WINDOW * WINDOW;
+        if abs.is_multiple_of((WINDOW * self.sector_size) as u64) && n >= WINDOW * self.sector_size {
+            let sectors = n / self.sector_size / WINDOW * WINDOW;
             self.flush_all().map_err(to_io)?;
-            let d = self.read_sectors(abs / SECTOR as u64, sectors).map_err(to_io)?;
+            let d = self.read_sectors(abs / self.sector_size as u64, sectors).map_err(to_io)?;
             buf[..d.len()].copy_from_slice(&d);
             self.pos += d.len() as u64;
             return Ok(d.len());
         }
-        let base = self.load(abs / SECTOR as u64).map_err(to_io)?;
+        let base = self.load(abs / self.sector_size as u64).map_err(to_io)?;
         let data = &self.cache[&base].0;
-        let from = (abs - base * SECTOR as u64) as usize;
+        let from = (abs - base * self.sector_size as u64) as usize;
         let k = n.min(data.len() - from);
         buf[..k].copy_from_slice(&data[from..from + k]);
         self.pos += k as u64;
@@ -1913,24 +1927,24 @@ impl Read for ScsiDisk<'_> {
 
 impl Write for ScsiDisk<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let abs = self.pos + self.offset * SECTOR as u64;
+        let abs = self.pos + self.offset * self.sector_size as u64;
         if abs >= self.len || buf.is_empty() {
             return Ok(0);
         }
         let n = buf.len().min((self.len - abs) as usize);
-        if abs.is_multiple_of((WINDOW * SECTOR) as u64) && n >= WINDOW * SECTOR {
+        if abs.is_multiple_of((WINDOW * self.sector_size) as u64) && n >= WINDOW * self.sector_size {
             // Whole windows in bulk: what the cache holds of them is stale.
-            let whole = n / (WINDOW * SECTOR) * (WINDOW * SECTOR);
+            let whole = n / (WINDOW * self.sector_size) * (WINDOW * self.sector_size);
             self.flush_all().map_err(to_io)?;
-            let (first, last) = (abs / SECTOR as u64, (abs + whole as u64) / SECTOR as u64);
+            let (first, last) = (abs / self.sector_size as u64, (abs + whole as u64) / self.sector_size as u64);
             self.cache.retain(|b, _| *b < first || *b >= last);
             self.write_sectors(first, &buf[..whole]).map_err(to_io)?;
             self.pos += whole as u64;
             return Ok(whole);
         }
-        let base = self.load(abs / SECTOR as u64).map_err(to_io)?;
+        let base = self.load(abs / self.sector_size as u64).map_err(to_io)?;
         let w = self.cache.get_mut(&base).expect("loaded");
-        let from = (abs - base * SECTOR as u64) as usize;
+        let from = (abs - base * self.sector_size as u64) as usize;
         let k = n.min(w.0.len() - from);
         w.0[from..from + k].copy_from_slice(&buf[..k]);
         w.1 = true;
@@ -1945,7 +1959,7 @@ impl Write for ScsiDisk<'_> {
 
 impl Seek for ScsiDisk<'_> {
     fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
-        let size = self.len - self.offset * SECTOR as u64;
+        let size = self.len - self.offset * self.sector_size as u64;
         let p = match to {
             SeekFrom::Start(p) => p as i64,
             SeekFrom::End(d) => size as i64 + d,
@@ -2095,6 +2109,7 @@ mod tests {
     /// the stack would (control transfers cut in 64-byte packets, BOT, SCSI).
     struct Fake {
         disk: Vec<u8>,
+        block_size: usize,
         protect: bool,
         /// Test unit ready fails this many times before the medium is there.
         not_ready: u32,
@@ -2138,6 +2153,7 @@ mod tests {
         fn new(disk: Vec<u8>) -> Fake {
             Fake {
                 disk,
+                block_size: 512,
                 protect: false,
                 not_ready: 0,
                 ejected: false,
@@ -2300,15 +2316,16 @@ mod tests {
                     reply(d)
                 }
                 0x25 => {
-                    let mut d = (((self.disk.len() / 512) - 1) as u32).to_be_bytes().to_vec();
-                    d.extend_from_slice(&512u32.to_be_bytes());
+                    let blocks = self.disk.len().checked_div(self.block_size).unwrap_or(0);
+                    let mut d = (blocks.saturating_sub(1) as u32).to_be_bytes().to_vec();
+                    d.extend_from_slice(&(self.block_size as u32).to_be_bytes());
                     reply(d)
                 }
                 0x1A => reply(vec![3, 0, if self.protect { 0x80 } else { 0 }, 0]),
-                0x28 => reply(self.disk[lba * 512..(lba + n) * 512].to_vec()),
+                0x28 => reply(self.disk[lba * self.block_size..(lba + n) * self.block_size].to_vec()),
                 0x2A => {
-                    assert_eq!(data.len(), n * 512);
-                    self.disk[lba * 512..(lba + n) * 512].copy_from_slice(data);
+                    assert_eq!(data.len(), n * self.block_size);
+                    self.disk[lba * self.block_size..(lba + n) * self.block_size].copy_from_slice(data);
                     reply(vec![])
                 }
                 0x35 => {
@@ -2332,9 +2349,16 @@ mod tests {
 
     /// A FAT volume of `mb` megabytes with one file in it.
     fn volume(mb: usize) -> Vec<u8> {
+        volume_with_sector_size(mb, 512)
+    }
+
+    fn volume_with_sector_size(mb: usize, sector_size: u16) -> Vec<u8> {
         let mut img = io::Cursor::new(vec![0u8; mb << 20]);
-        fatfs::format_volume(&mut img, fatfs::FormatVolumeOptions::new().volume_label(*b"KODE_CARD  "))
-            .expect("format");
+        fatfs::format_volume(
+            &mut img,
+            fatfs::FormatVolumeOptions::new().bytes_per_sector(sector_size).volume_label(*b"KODE_CARD  "),
+        )
+        .expect("format");
         {
             let fs = fatfs::FileSystem::new(&mut img, fatfs::FsOptions::new()).expect("mount");
             let mut f = fs.root_dir().create_file("hello.txt").expect("create");
@@ -2471,6 +2495,46 @@ mod tests {
         let mut hello = String::new();
         fs.root_dir().open_file("hello.txt").expect("open").read_to_string(&mut hello).expect("read");
         assert_eq!(hello, "hello from the card");
+    }
+
+    #[test]
+    fn fat_io_uses_the_logical_block_size_reported_by_the_device() {
+        for block_size in [512, 1024, 2048, 4096] {
+            let mut device = Fake::new(volume_with_sector_size(4, block_size));
+            device.block_size = usize::from(block_size);
+            let r = rig(device);
+            r.host.command(Cmd::Plug);
+            let u = r.stage("mounted");
+            assert_eq!(u["disk"]["block_size"], block_size);
+            let data: Vec<_> = (0..usize::from(block_size) * WINDOW + 3).map(|i| (i % 251) as u8).collect();
+            r.host.command(Cmd::Put { name: "blocks.bin".into(), data: data.clone() });
+            r.wait("file copied with the declared block size", |u| {
+                u["disk"]["files"]
+                    .as_array()
+                    .is_some_and(|files| files.iter().any(|f| f["name"] == "blocks.bin" && f["size"] == data.len()))
+            });
+            r.host.command(Cmd::Get { name: "blocks.bin".into() });
+            r.wait("file read with the declared block size", |u| {
+                u["last"].as_str().is_some_and(|line| line.contains(&format!("crc32 {:08x}", crc32(&data))))
+            });
+            let mut image = io::Cursor::new(r.fake.lock().unwrap().disk.clone());
+            let fs = fatfs::FileSystem::new(&mut image, fatfs::FsOptions::new()).unwrap();
+            let mut actual = Vec::new();
+            fs.root_dir().open_file("blocks.bin").unwrap().read_to_end(&mut actual).unwrap();
+            assert_eq!(actual, data);
+        }
+    }
+
+    #[test]
+    fn invalid_logical_block_sizes_are_rejected_before_fat_io() {
+        for block_size in [0, 256, 768, 8192] {
+            let mut device = Fake::new(volume(4));
+            device.block_size = block_size;
+            let r = rig(device);
+            r.host.command(Cmd::Plug);
+            let u = r.stage("failed");
+            assert!(u["error"].as_str().unwrap().contains("unsupported FAT logical block size"));
+        }
     }
 
     #[test]
@@ -2868,6 +2932,34 @@ mod tests {
         let emitted = snapshots.lock().unwrap();
         assert_eq!(emitted.last().unwrap()["usb"]["hid"]["reports"][0]["mouse"]["sequence"], 3);
         assert_eq!(emitted.last().unwrap()["usb"]["hid"]["reports"][0]["mouse"]["total"]["x"], 30);
+    }
+
+    #[test]
+    fn closing_the_mouse_endpoint_preserves_the_keyboards_pending_accent() {
+        let (_, rx) = mpsc::channel();
+        let mut host = Host::new(rx, Arc::new(|_, _| {}), Arc::new(|_| {}));
+        let keyboard = hid::test_support::keyboard();
+        let mouse = hid::test_support::mouse();
+        let f = composite_fake(&[(5, 0x83, keyboard.clone()), (7, 0x86, mouse.clone())]);
+        host.parse_config(f.configuration.as_ref().unwrap()).unwrap();
+        for (number, report) in [(5, keyboard), (7, mouse)] {
+            host.hid.insert(
+                number,
+                HidInterface { descriptor: Some(hid::Descriptor::parse(&report).unwrap()), error: String::new() },
+            );
+        }
+        host.cable = true;
+        host.pullup = true;
+        host.stage = Stage::Hid;
+        host.apply(Ev::In(0x83, vec![0, 0, 52, 0, 0, 0, 0, 0]));
+        host.apply(Ev::In(0x86, vec![1, 1, 2, 3]));
+        assert_eq!(host.dead.len(), 1);
+        host.apply(Ev::Dev(DEV_EP_CLOSE, 0x86));
+        assert_eq!(host.snapshot()["usb"]["keys_down"], json!([52]));
+        assert_eq!(host.snapshot()["usb"]["mouse"]["buttons"], json!([]));
+        host.apply(Ev::In(0x83, vec![0, 0, 8, 0, 0, 0, 0, 0]));
+        assert_eq!(host.typed, "é");
+        assert!(host.dead.is_empty());
     }
 
     #[test]

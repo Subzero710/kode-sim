@@ -56,6 +56,9 @@ offsets for every Report ID. Local usages and usage ranges reset after every
 Main item. Extended usages carry their own Usage Page. Array values select
 from the declared usage list relative to Logical Minimum; variable fields
 follow the declared usage sequence, including repetition of its final usage.
+Capability detection uses only usages reachable through the field's Report Count
+or array selector range. A supported axis within a wider Usage Minimum/Maximum
+range remains visible; unused trailing usages cannot advertise a capability.
 
 Report ID presence comes exclusively from the descriptor. IDs are scoped to
 their interface. Reports must have the exact declared byte length, including
@@ -136,6 +139,8 @@ its input state; closing all endpoints clears all input state. Previously typed
 text remains, preserving the existing `clear_typed` behaviour. The existing
 phase-1 restart barrier drops old-boot transfers until the new boot's pull-up;
 no wire protocol or firmware delivery barrier is replaced.
+Closing one endpoint preserves pending accents and held state belonging to the
+remaining keyboard collections.
 
 ## Web visualization (phase 3)
 
@@ -204,7 +209,7 @@ existing keyboard and all four descriptor architectures over real WebSockets
 against the explicitly fake host-test device.
 
 The `usb_hid_firmware` fixture in `tests/test_usb_emu.py` builds keyboard,
-mouse, separate-interface and shared-interface firmware with ESP-IDF 6.1,
+mouse, separate-interface, shared-interface and shared-HID/MSC firmware with ESP-IDF 6.1,
 ESP-TinyUSB 2.2.0 and the actual resolved TinyUSB component. It uses the same
 local-SDK build route as phase 1 and never uses `fake_emu`. Reports are sent
 through `tud_hid_n_keyboard_report` / `tud_hid_n_mouse_report`, the real DCD,
@@ -212,6 +217,21 @@ Rust host and WebSockets. Tests require held/released states, interleaving,
 repeated deltas, late clients, cable reconnection, bus reset, device
 disconnect/reconnect, uninstall/reinstall and firmware reboot. The three
 original lifecycle fixture variants remain.
+
+Additional real-firmware checks cover all modifier bits, simultaneous keys,
+partial release, US/ES punctuation, invalid report lengths, unknown IDs,
+rollover, mouse bounds and button edges, endpoint close/reopen, WebSocket
+reconnection and repeated simulator shutdown/startup. MSC uses the official
+ESP-TinyUSB SPI flash backend, with FAT writes read back and checked by CRC.
+`tests/hid_page.mjs` feeds the resulting Rust snapshots to the same page harness
+as the standalone JavaScript suite; it checks displayed state, cumulative motion,
+duplicate snapshots and the embedded viewport. The device remains the real
+`esp-emu`, independently of this DOM harness.
+
+Heap integrity, free bytes and task counts are checked during the real USB
+lifecycle tests. The Python host suite continues to identify its fake device
+explicitly. Node is required by `tools/host_tests.sh`; its absence fails the
+command instead of reporting a successful run with the page tests omitted.
 
 Run from the repository root:
 
@@ -231,56 +251,23 @@ ctest --test-dir build_tests --output-on-failure
 git diff --check
 ```
 
-### Observed real-firmware blocker
+### Current validation
 
-At implementation time, the phase-1 reference was
-`44cf403140bd53ff56f40c08e71a74570ad8947d` and the unchanged SDK fetched by the
-existing fixture was `a816feeee2a3703ce23a2e6697154b0cc6910fd7`.
-That SDK's `kaos.h` declares `bool` returns for `radio_state_request`,
-`wifi_start_request`, `wifi_state_request` and `wifi_fast_request`. Existing
-`firmware/kemu/src/kemu_radio.c` defines weak `void` implementations, producing
-GCC `conflicting types` errors before firmware linkage. This affects the
-original lifecycle fixtures as well as the new HID variants. No SDK, KodeOS,
-esp-emu source or unrelated radio code is patched to conceal the failure.
+The former `kemu_radio.c` return-type compilation blocker is resolved: the
+fixtures build against the actual SDK's `bool` declarations. The real USB
+suite exercises ESP-TinyUSB 2.2.0, resolved TinyUSB 0.21.0~6, direct TinyUSB and
+the explicitly pinned 0.19.0~3 variant. The four HID architectures and the
+additional HID/MSC configuration execute in the real emulator.
 
-All four new firmware main translation units compiled successfully against
-the genuine resolved headers (ESP-TinyUSB 2.2.0, TinyUSB 0.21.0~6, IDF v6.1).
-That compilation is not an end-to-end emulator result. The real-firmware
-chain remains unvalidated until the SDK/shim incompatibility is resolved and
-the emulator commands above complete successfully. Build output is retained
-by the normal `kode-sim build` cache and its error identifies the full log.
+Unmodified KodeOS still fails to compile with `CONFIG_KODE_LOWPOWER=n` because
+`kgui_ao.c` uses conditionally omitted fields and functions. Results for that
+official checkout must remain separate from a locally corrected checkout
+selected by `KODEOS`. Firmware console milestones are checked within the new
+boot's journal window without imposing an order on independent SDK messages.
 
-The full emulator suite also fetched unchanged KodeOS
-`c59213adbd07a256ba5606e3c9956182be13ecac`, which fails compilation in
-`components/kgui/kgui_ao.c`: `Gui` lacks `card_full_due` / `park_seq`, and
-`gui_card_full_due_say` / `gui_card_full_say` are undeclared. These failures
-are not repaired in this HID patch.
+The phase-2/3 validation table from the parent history is historical evidence
+only. It does not validate the current source tree.
 
-### Recorded validation, 2026-11-17
-
-| Command | Exit | Observed result |
-| --- | --- | --- |
-| `cargo fmt --all --check` | 0 | Passed |
-| `cargo clippy --all-targets -- -D warnings` | 0 | Passed |
-| `cargo test --all-targets` | 0 | 149 kode-sim, 9 cosim and 37 chip tests passed (195 total) |
-| `cargo build --release -p kode-sim` | 0 | Passed |
-| `tools/host_tests.sh` | 0 | Rust/build, 116 Python tests, 26 page tests and 3 C tests passed |
-| `cmake -S firmware/tests -B build_tests` | 0 | Configured |
-| `cmake --build build_tests` | 0 | Built |
-| `ctest --test-dir build_tests --output-on-failure` | 0 | 3/3 passed |
-| `.venv/bin/pytest -vv -s tests/test_usb.py` | 0 | 8 passed; the final full host run also exercised the added quick-click assertions |
-| `.venv/bin/pytest -vv -s -m emu tests/test_usb_emu.py` | 1 | 7 fixture-build errors; no HID firmware execution |
-| `.venv/bin/pytest -vv -s -m emu tests` | 1 | 1 passed, 1 failed, 31 errors; the successful case boots a board binary, not the HID fixture |
-| `git diff --check` | 0 | Passed |
-
-The original three lifecycle variants and four new HID main translation
-units also compiled independently with their exact generated compiler
-commands (all seven exit codes zero). This checks compatibility with genuine
-resolved headers, including the original TinyUSB 0.19.0~3 variant; it does
-not bypass or validate failed firmware linkage.
-
-An initial host-suite run timed out in
-`test_the_battery_from_the_page_reaches_the_gauge_and_every_page` while
-waiting for `i2c 64 04: 2a`. Its isolated rerun and subsequent complete host
-runs passed. The timeout's cause was not established, and that test was not
-modified.
+See [Phase 4 validation](USB_VALIDATION.md) for the dated command results,
+tested commits, resolved versions, initial failures and corrections, ELF
+evidence, and the separately recorded official/local KodeOS outcomes.

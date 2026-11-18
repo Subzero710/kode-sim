@@ -80,6 +80,11 @@ exclusive and validated; invalid or repeated deletion cannot disconnect the
 active device. The host's `{"usb":{"cmd":"reset"}}` command resets and
 enumerates a device without toggling its cable.
 
+Closing or reopening an endpoint also removes that endpoint's undelivered
+completion events from the controller model. Closing all non-control endpoints
+retains EP0 completions; a new SETUP removes the retiring control transfer's
+completions while preserving other endpoints' events.
+
 ## Reproducing the checks
 
 Use ESP-IDF v6.1, a working kode-sdk checkout, Rust with rustfmt/clippy, the
@@ -113,3 +118,18 @@ shutdown, stale frames after stopping
 and repeated uninstall/reinstall. Host C tests cover control, keyboard IN and
 MSC-style bulk OUT transfers, endpoint validation, stalls, resets and buffer
 cleanup. Existing Rust/Python suites exercise keyboard and MSC host behavior.
+
+The real firmware suite additionally exercises shared HID plus ESP-TinyUSB's
+official SPI flash MSC storage API. The storage partition is discovered through
+the SDK's partition table and its logical sector size comes from wear levelling.
+The host uses the size returned by READ CAPACITY throughout FAT reads, writes,
+seeks and its cache, including the fixture's 4096-byte sectors. It rejects sizes
+outside the FAT library's supported range instead of substituting a sector size.
+
+Lifecycle checks call ESP-IDF's heap integrity checker and compare free heap and
+FreeRTOS task counts before and after the tested transitions. Real Rust snapshots
+are also passed to `web/sim.js` through the shared DOM test harness, including
+repeated snapshots and a small embedded viewport. No OS input API is used.
+
+Exact tested commits, resolved versions, command results and the separate
+official/local KodeOS outcomes are recorded in [Phase 4 validation](USB_VALIDATION.md).

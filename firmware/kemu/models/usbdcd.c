@@ -35,6 +35,17 @@ static void queue_xfer(kemu_usb_t *m, uint8_t ep_addr, uint32_t len, bool ok)
     }
 }
 
+static void drop_completions(kemu_usb_t *m, uint8_t ep_addr)
+{
+    uint32_t kept = 0;
+    for (uint32_t i = 0; i < m->nev; i++) {
+        if (m->ev[i].kind != KEMU_USB_EV_XFER || m->ev[i].ep_addr != ep_addr) {
+            m->ev[kept++] = m->ev[i];
+        }
+    }
+    m->nev = kept;
+}
+
 static kemu_usb_ep_t *ep_of(kemu_usb_t *m, uint8_t ep_addr)
 {
     uint8_t const n = ep_addr & 0x7FU;
@@ -152,6 +163,7 @@ bool kemu_usb_dcd_edpt_open(kemu_usb_t *m, uint8_t ep_addr, uint16_t mps, uint8_
         mps > (type == 1U ? 1023U : 64U)) {
         return false;
     }
+    drop_completions(m, ep_addr);
     reset_ep(e);
     e->open = true;
     e->mps = mps;
@@ -164,6 +176,7 @@ void kemu_usb_dcd_edpt_close(kemu_usb_t *m, uint8_t ep_addr)
 {
     kemu_usb_ep_t *e = ep_of(m, ep_addr);
     if (m->inited && e != NULL && (ep_addr & 0x7FU) != 0U) {
+        drop_completions(m, ep_addr);
         reset_ep(e);
         m->out.dev(m->ctx, KEMU_USB_DEV_EP_CLOSE, ep_addr, 0);
     }
@@ -173,6 +186,8 @@ void kemu_usb_dcd_edpt_close_all(kemu_usb_t *m)
 {
     if (!m->inited) { return; }
     for (uint32_t i = 1; i < KEMU_USB_EPS; i++) {
+        drop_completions(m, (uint8_t)(i | 0x80U));
+        drop_completions(m, (uint8_t)i);
         reset_ep(&m->in[i]);
         reset_ep(&m->outp[i]);
     }
@@ -313,7 +328,12 @@ void kemu_usb_bus(kemu_usb_t *m, uint8_t kind)
 
 void kemu_usb_setup(kemu_usb_t *m, const uint8_t setup[8])
 {
-    if (!m->on_bus || m->nev >= KEMU_USB_EV_MAX) {
+    if (!m->on_bus) {
+        return;
+    }
+    drop_completions(m, 0x80U);
+    drop_completions(m, 0U);
+    if (m->nev >= KEMU_USB_EV_MAX) {
         return;
     }
     /* A SETUP aborts whatever the control pipe was doing and clears its stall. */

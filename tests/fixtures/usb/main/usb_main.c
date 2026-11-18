@@ -3,9 +3,13 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include <errno.h>
 #include "driver/usb_serial_jtag.h"
 #include "esp_err.h"
 #include "esp_idf_version.h"
+#include "esp_heap_caps.h"
 #include "esp_private/usb_phy.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -13,6 +17,16 @@
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
 #include "device/dcd.h"
+#ifdef CONFIG_USB_TEST_MSC
+#include "esp_partition.h"
+#include "tinyusb_msc.h"
+#endif
+
+#ifdef TUP_DCD_EDPT_ISO_ALLOC
+/* The virtual DCD also implements per-endpoint close; P4's hardware DCD
+ * advertises only ISO allocation and leaves this declaration out. */
+extern void dcd_edpt_close(uint8_t rhport, uint8_t ep_addr);
+#endif
 
 /* IDs are fixture data and are shared by the descriptor and sender. The
  * host must discover them from the descriptors, including these non-boot IDs. */
@@ -33,7 +47,7 @@ static const uint8_t config_desc[] = {
 #else
 enum { TEST_INSTANCE_KEYBOARD, TEST_INSTANCE_MOUSE = TEST_INSTANCE_KEYBOARD };
 static const uint8_t report_desc[] = {
-#if defined(CONFIG_USB_TEST_SHARED)
+#if defined(CONFIG_USB_TEST_SHARED) || defined(CONFIG_USB_TEST_MSC)
     TUD_HID_REPORT_DESC_KEYBOARD(HID_REPORT_ID(TEST_REPORT_KEYBOARD)),
     TUD_HID_REPORT_DESC_MOUSE(HID_REPORT_ID(TEST_REPORT_MOUSE)),
 #elif defined(CONFIG_USB_TEST_MOUSE)
@@ -42,10 +56,15 @@ static const uint8_t report_desc[] = {
     TUD_HID_REPORT_DESC_KEYBOARD(),
 #endif
 };
+#ifdef CONFIG_USB_TEST_MSC
+enum { TEST_ITF_COUNT = 2, TEST_CONFIG_LENGTH = TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN + TUD_MSC_DESC_LEN };
+#else
+enum { TEST_ITF_COUNT = 1, TEST_CONFIG_LENGTH = TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN };
+#endif
 static const uint8_t config_desc[] = {
-    TUD_CONFIG_DESCRIPTOR(1, 1, 0, TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN,
+    TUD_CONFIG_DESCRIPTOR(1, TEST_ITF_COUNT, 0, TEST_CONFIG_LENGTH,
                           TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
-#if defined(CONFIG_USB_TEST_SHARED)
+#if defined(CONFIG_USB_TEST_SHARED) || defined(CONFIG_USB_TEST_MSC)
     TUD_HID_DESCRIPTOR(0, 0, HID_ITF_PROTOCOL_NONE, sizeof report_desc,
                        0x81, CFG_TUD_HID_EP_BUFSIZE, 10),
 #elif defined(CONFIG_USB_TEST_MOUSE)
@@ -54,6 +73,9 @@ static const uint8_t config_desc[] = {
 #else
     TUD_HID_DESCRIPTOR(0, 0, HID_ITF_PROTOCOL_KEYBOARD, sizeof report_desc,
                        0x81, sizeof(hid_keyboard_report_t), 10),
+#endif
+#ifdef CONFIG_USB_TEST_MSC
+    TUD_MSC_DESCRIPTOR(1, 0, 0x02, 0x82, 64),
 #endif
 };
 #endif
@@ -66,6 +88,26 @@ static const tusb_desc_device_t device_desc = {
 static const char *strings[] = { (const char[]){0x09, 0x04}, "kode-sim", "ESP-TinyUSB lifecycle" };
 static unsigned mounts, unmounts;
 
+#ifdef CONFIG_USB_TEST_MSC
+static void storage_init(void)
+{
+    const esp_partition_t *partition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_FAT, NULL);
+    configASSERT(partition != NULL);
+    wl_handle_t wl;
+    ESP_ERROR_CHECK(wl_mount(partition, &wl));
+    printf("USB storage sector=%zu\n", wl_sector_size(wl));
+    const tinyusb_msc_storage_config_t config = {
+        .medium.wl_handle = wl,
+        .fat_fs = {
+            .base_path = "/usb-test",
+            .config = { .format_if_mount_failed = true, .max_files = 1 },
+        },
+        .mount_point = TINYUSB_MSC_STORAGE_MOUNT_APP,
+    };
+    ESP_ERROR_CHECK(tinyusb_msc_new_storage_spiflash(&config, NULL));
+}
+#endif
+
 uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance)
 {
 #if defined(CONFIG_USB_TEST_SEPARATE)
@@ -75,6 +117,12 @@ uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance)
 #else
     return instance == TEST_INSTANCE_KEYBOARD ? report_desc : NULL;
 #endif
+}
+
+void tud_hid_report_complete_cb(uint8_t instance, uint8_t const *report, uint16_t len)
+{
+    (void)report;
+    printf("USB report complete instance=%u length=%u\n", (unsigned)instance, (unsigned)len);
 }
 uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t type,
                               uint8_t *buffer, uint16_t size)
@@ -180,6 +228,40 @@ static void race_install(void *arg)
 }
 #endif
 
+static bool byte_argument(const char **text, unsigned base, uint8_t *value)
+{
+    while (isspace((unsigned char)**text)) { ++*text; }
+    if (!isxdigit((unsigned char)**text)) { return false; }
+    char *end;
+    errno = 0;
+    unsigned long const number = strtoul(*text, &end, base);
+    if (end == *text || errno != 0 || number > UINT8_MAX || (*end != '\0' && !isspace((unsigned char)*end))) {
+        return false;
+    }
+    *text = end;
+    while (isspace((unsigned char)**text)) { ++*text; }
+    *value = (uint8_t)number;
+    return true;
+}
+
+static const tusb_desc_endpoint_t *input_endpoint(uint8_t instance)
+{
+    uint8_t hid_instance = 0;
+    bool selected = false;
+    for (const uint8_t *p = config_desc; p < config_desc + sizeof config_desc; p += tu_desc_len(p)) {
+        if (tu_desc_type(p) == TUSB_DESC_INTERFACE) {
+            const tusb_desc_interface_t *itf = (const tusb_desc_interface_t *)p;
+            selected = itf->bInterfaceClass == TUSB_CLASS_HID && hid_instance++ == instance;
+        } else if (selected && tu_desc_type(p) == TUSB_DESC_ENDPOINT) {
+            const tusb_desc_endpoint_t *ep = (const tusb_desc_endpoint_t *)p;
+            if (tu_edpt_dir(ep->bEndpointAddress) == TUSB_DIR_IN && ep->bmAttributes.xfer == TUSB_XFER_INTERRUPT) {
+                return ep;
+            }
+        }
+    }
+    return NULL;
+}
+
 static void command(const char *line)
 {
     esp_err_t ret = ESP_ERR_INVALID_ARG;
@@ -194,11 +276,17 @@ static void command(const char *line)
 #endif
     else if (strcmp(line, "yield") == 0) { vTaskDelay(1); ret = ESP_OK; }
     else if (strcmp(line, "bad_phy") == 0) { ret = usb_del_phy((usb_phy_handle_t)&mounts); }
+    else if (strcmp(line, "resources") == 0) {
+        vTaskDelay(1);
+        ret = heap_caps_check_integrity_all(true) ? ESP_OK : ESP_FAIL;
+        printf("USB resources heap=%zu tasks=%u\n", heap_caps_get_free_size(MALLOC_CAP_8BIT),
+               (unsigned)uxTaskGetNumberOfTasks());
+    }
     else if (strcmp(line, "report") == 0) {
 #if !defined(CONFIG_USB_TEST_MOUSE)
         uint8_t keys[6] = { HID_KEY_A };
         ret = tud_hid_n_keyboard_report(TEST_INSTANCE_KEYBOARD,
-#if defined(CONFIG_USB_TEST_SHARED)
+#if defined(CONFIG_USB_TEST_SHARED) || defined(CONFIG_USB_TEST_MSC)
                                        TEST_REPORT_KEYBOARD,
 #else
                                        0,
@@ -232,27 +320,33 @@ static void command(const char *line)
 #endif
     else if (strncmp(line, "key ", 4U) == 0) {
 #if !defined(CONFIG_USB_TEST_MOUSE)
-        unsigned mods, key; char extra;
-        if (sscanf(line + 4, "%u %u %c", &mods, &key, &extra) == 2 && mods <= UINT8_MAX && key <= UINT8_MAX) {
-            uint8_t keys[6] = { (uint8_t)key };
+        hid_keyboard_report_t report = {0};
+        const char *args = line + 4;
+        bool valid = byte_argument(&args, 10, &report.modifier);
+        size_t count = 0;
+        while (valid && *args != '\0') {
+            valid = count < sizeof report.keycode && byte_argument(&args, 10, &report.keycode[count]);
+            ++count;
+        }
+        if (valid && count != 0U) {
             ret = tud_hid_n_keyboard_report(TEST_INSTANCE_KEYBOARD,
-#if defined(CONFIG_USB_TEST_SHARED)
+#if defined(CONFIG_USB_TEST_SHARED) || defined(CONFIG_USB_TEST_MSC)
                                            TEST_REPORT_KEYBOARD,
 #else
                                            0,
 #endif
-                                           (uint8_t)mods, keys) ? ESP_OK : ESP_FAIL;
+                                           report.modifier, report.keycode) ? ESP_OK : ESP_FAIL;
         }
 #else
         ret = ESP_ERR_NOT_SUPPORTED;
 #endif
     } else if (strncmp(line, "mouse ", 6U) == 0) {
-#if defined(CONFIG_USB_TEST_MOUSE) || defined(CONFIG_USB_TEST_SEPARATE) || defined(CONFIG_USB_TEST_SHARED)
+#if defined(CONFIG_USB_TEST_MOUSE) || defined(CONFIG_USB_TEST_SEPARATE) || defined(CONFIG_USB_TEST_SHARED) || defined(CONFIG_USB_TEST_MSC)
         unsigned buttons; int x, y, wheel; char extra;
         if (sscanf(line + 6, "%u %d %d %d %c", &buttons, &x, &y, &wheel, &extra) == 4 && buttons <= UINT8_MAX
             && x >= INT8_MIN && x <= INT8_MAX && y >= INT8_MIN && y <= INT8_MAX && wheel >= INT8_MIN && wheel <= INT8_MAX) {
             ret = tud_hid_n_mouse_report(TEST_INSTANCE_MOUSE,
-#if defined(CONFIG_USB_TEST_SHARED)
+#if defined(CONFIG_USB_TEST_SHARED) || defined(CONFIG_USB_TEST_MSC)
                                         TEST_REPORT_MOUSE,
 #else
                                         0,
@@ -262,6 +356,26 @@ static void command(const char *line)
 #else
         ret = ESP_ERR_NOT_SUPPORTED;
 #endif
+    } else if (strncmp(line, "raw ", 4U) == 0) {
+        const char *args = line + 4;
+        uint8_t instance, report_id, data[CFG_TUD_HID_EP_BUFSIZE];
+        bool valid = byte_argument(&args, 10, &instance) && byte_argument(&args, 10, &report_id);
+        size_t count = 0;
+        while (valid && *args != '\0') {
+            valid = count < sizeof data && byte_argument(&args, 16, &data[count]);
+            ++count;
+        }
+        if (valid) { ret = tud_hid_n_report(instance, report_id, data, count) ? ESP_OK : ESP_FAIL; }
+    } else if (strncmp(line, "endpoint ", 9U) == 0) {
+        const char *args = line + 9;
+        uint8_t instance, open;
+        if (byte_argument(&args, 10, &instance) && byte_argument(&args, 10, &open) && *args == '\0' && open <= 1U) {
+            const tusb_desc_endpoint_t *ep = input_endpoint(instance);
+            if (ep != NULL && tud_mounted()) {
+                if (open) { ret = dcd_edpt_open(TINYUSB_PORT_FULL_SPEED_0, ep) ? ESP_OK : ESP_FAIL; }
+                else { dcd_edpt_close(TINYUSB_PORT_FULL_SPEED_0, ep->bEndpointAddress); ret = ESP_OK; }
+            }
+        }
     }
     printf("USB result %s %s\n", line, esp_err_to_name(ret));
     fflush(stdout);
@@ -270,6 +384,9 @@ static void command(const char *line)
 void app_main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
+#ifdef CONFIG_USB_TEST_MSC
+    storage_init();
+#endif
     printf("USB versions idf=%s tinyusb=%u.%u.%u\n", esp_get_idf_version(),
            TUSB_VERSION_MAJOR, TUSB_VERSION_MINOR, TUSB_VERSION_REVISION);
 #ifndef CONFIG_USB_TEST_DIRECT
