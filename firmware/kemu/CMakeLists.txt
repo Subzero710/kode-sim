@@ -22,12 +22,31 @@ idf_component_register(
 set(KEMU_WRAPS
     app_main
     tinyusb_driver_install usb_new_phy usb_del_phy
-    dcd_init dcd_deinit dcd_int_handler dcd_int_enable dcd_int_disable dcd_set_address
-    dcd_remote_wakeup dcd_connect dcd_disconnect dcd_sof_enable dcd_edpt0_status_complete
-    dcd_edpt_open dcd_edpt_close dcd_edpt_close_all dcd_edpt_iso_alloc dcd_edpt_iso_activate
-    dcd_edpt_xfer dcd_edpt_xfer_fifo dcd_edpt_stall dcd_edpt_clear_stall
     usb_serial_jtag_read_bytes)
 
 foreach(sym ${KEMU_WRAPS})
     target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=${sym}")
+endforeach()
+
+# Match TinyUSB as a local component or an ESP-IDF managed component.
+idf_build_get_property(kemu_components BUILD_COMPONENTS)
+foreach(component IN LISTS kemu_components)
+    if(component MATCHES "(^|__)tinyusb$")
+        idf_component_get_property(kemu_tusb_lib ${component} COMPONENT_LIB)
+        target_link_libraries(${COMPONENT_LIB} PRIVATE ${kemu_tusb_lib})
+        # A managed build can supply tusb_config.h through TinyUSB's private includes.
+        target_include_directories(${COMPONENT_LIB} PRIVATE
+            "$<TARGET_PROPERTY:${kemu_tusb_lib},INCLUDE_DIRECTORIES>")
+        target_compile_definitions(${COMPONENT_LIB} PRIVATE KEMU_USB_TINYUSB=1)
+        set(kemu_dcd_wraps
+            dcd_init dcd_deinit dcd_int_handler dcd_int_enable dcd_int_disable dcd_set_address
+            dcd_remote_wakeup dcd_connect dcd_disconnect dcd_sof_enable dcd_edpt0_status_complete
+            dcd_edpt_open dcd_edpt_close dcd_edpt_close_all dcd_edpt_iso_alloc dcd_edpt_iso_activate
+            dcd_edpt_xfer dcd_edpt_xfer_fifo dcd_edpt_stall dcd_edpt_clear_stall
+        )
+        foreach(sym IN LISTS kemu_dcd_wraps)
+            target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=${sym}")
+        endforeach()
+        break()
+    endif()
 endforeach()

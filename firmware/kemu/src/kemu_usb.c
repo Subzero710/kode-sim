@@ -17,13 +17,10 @@
  * tinyusb_driver_install() - esp_tinyusb, which kodeOS uses for its dock
  * port - still answers "not supported": kodeOS says so at once instead of
  * waiting five seconds for a stack that would never start.
- *
- * dcd_event_handler() is TinyUSB's; it is declared weak so an app with no
- * TinyUSB links without it (nothing there calls the wrappers either).
  */
 #include <stdbool.h>
 #include <stdint.h>
-#include <string.h>
+#include <stddef.h>
 
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
@@ -33,37 +30,41 @@
 #include "kemu_usb.h"
 #include "kemu_usbdcd.h"
 
-/* TinyUSB 0.19's dcd_event_t, byte for byte (device/dcd.h): rhport, event_id,
- * then a union that starts at offset 4. The numbers are dcd_eventid_t's. */
-typedef struct {
-    uint8_t rhport;
-    uint8_t event_id;
-    uint16_t pad;
-    union {
-        uint32_t speed;                                         /* bus_reset.speed */
-        uint8_t setup[8];                                       /* setup_received */
-        struct { uint8_t ep_addr; uint8_t result; uint16_t pad; uint32_t len; } xfer;  /* xfer_complete */
-        uint32_t raw[2];
-    } u;
-} tu_event_t;
-_Static_assert(sizeof(tu_event_t) == 12, "dcd_event_t is 12 bytes in TinyUSB 0.19");
+#ifdef KEMU_USB_TINYUSB
+#include "tusb.h"
+#include "device/dcd.h"
 
-#define TU_EVT_BUS_RESET   1U
-#define TU_EVT_UNPLUGGED   2U
-#define TU_EVT_SUSPEND     4U
-#define TU_EVT_RESUME      5U
-#define TU_EVT_SETUP       6U
-#define TU_EVT_XFER        7U
-#define TU_SPEED_FULL      0U
+/* Leave the stack unlinked if it is installed but unused by the firmware. */
+#pragma weak dcd_event_handler
 
-/* tusb_desc_endpoint_t, packed: bLength, bDescriptorType, bEndpointAddress, bmAttributes, wMaxPacketSize, bInterval. */
-typedef struct __attribute__((packed)) {
-    uint8_t bLength, bDescriptorType, bEndpointAddress, bmAttributes;
-    uint16_t wMaxPacketSize;
-    uint8_t bInterval;
-} tu_desc_ep_t;
-
-extern void dcd_event_handler(const tu_event_t *event, bool in_isr) __attribute__((weak));
+/* Linker wrappers need an explicit compile-time check against TinyUSB's headers. */
+#define CHECK_WRAP(sym) extern __typeof__(sym) __wrap_ ## sym
+CHECK_WRAP(dcd_init);
+CHECK_WRAP(dcd_deinit);
+CHECK_WRAP(dcd_int_handler);
+CHECK_WRAP(dcd_int_enable);
+CHECK_WRAP(dcd_int_disable);
+CHECK_WRAP(dcd_set_address);
+CHECK_WRAP(dcd_remote_wakeup);
+CHECK_WRAP(dcd_connect);
+CHECK_WRAP(dcd_disconnect);
+CHECK_WRAP(dcd_sof_enable);
+CHECK_WRAP(dcd_edpt0_status_complete);
+CHECK_WRAP(dcd_edpt_open);
+CHECK_WRAP(dcd_edpt_close_all);
+#if (TUSB_VERSION_NUMBER < 2000 && defined(TUP_DCD_EDPT_ISO_ALLOC)) || \
+    (TUSB_VERSION_NUMBER >= 2000 && !defined(TUP_DCD_EDPT_CLOSE_API))
+CHECK_WRAP(dcd_edpt_iso_alloc);
+CHECK_WRAP(dcd_edpt_iso_activate);
+#else
+CHECK_WRAP(dcd_edpt_close);
+#endif
+CHECK_WRAP(dcd_edpt_xfer);
+CHECK_WRAP(dcd_edpt_xfer_fifo);
+CHECK_WRAP(dcd_edpt_stall);
+CHECK_WRAP(dcd_edpt_clear_stall);
+#undef CHECK_WRAP
+#endif
 
 static kemu_usb_t s_m;
 static SemaphoreHandle_t s_lock;
@@ -106,30 +107,28 @@ static void ensure(void)
 /* What the model queued goes to the stack, outside the lock: the stack's queue may block. */
 static void deliver(void)
 {
-    kemu_usb_ev_t ev[KEMU_USB_EV_MAX];
-    uint32_t const n = s_ints ? kemu_usb_take_events(&s_m, ev, KEMU_USB_EV_MAX) : 0U;
+#ifdef KEMU_USB_TINYUSB
+    kemu_usb_ev_t events[KEMU_USB_EV_MAX];
+    uint32_t const count = s_ints ? kemu_usb_take_events(&s_m, events, KEMU_USB_EV_MAX) : 0U;
+#endif
     xSemaphoreGive(s_lock);
-    if (dcd_event_handler == NULL) {
-        return;
-    }
-    for (uint32_t i = 0; i < n; i++) {
-        tu_event_t t;
-        memset(&t, 0, sizeof t);
-        switch (ev[i].kind) {
-        case KEMU_USB_EV_BUS_RESET: t.event_id = TU_EVT_BUS_RESET; t.u.speed = TU_SPEED_FULL; break;
-        case KEMU_USB_EV_UNPLUGGED: t.event_id = TU_EVT_UNPLUGGED; break;
-        case KEMU_USB_EV_SUSPEND:   t.event_id = TU_EVT_SUSPEND; break;
-        case KEMU_USB_EV_RESUME:    t.event_id = TU_EVT_RESUME; break;
-        case KEMU_USB_EV_SETUP:     t.event_id = TU_EVT_SETUP; memcpy(t.u.setup, ev[i].setup, 8); break;
+#ifdef KEMU_USB_TINYUSB
+    if (dcd_event_handler == NULL) { return; }
+    for (uint32_t i = 0; i < count; i++) {
+        const kemu_usb_ev_t *event = &events[i];
+        switch (event->kind) {
+        case KEMU_USB_EV_BUS_RESET: dcd_event_bus_reset(0, TUSB_SPEED_FULL, false); break;
+        case KEMU_USB_EV_UNPLUGGED: dcd_event_bus_signal(0, DCD_EVENT_UNPLUGGED, false); break;
+        case KEMU_USB_EV_SUSPEND: dcd_event_bus_signal(0, DCD_EVENT_SUSPEND, false); break;
+        case KEMU_USB_EV_RESUME: dcd_event_bus_signal(0, DCD_EVENT_RESUME, false); break;
+        case KEMU_USB_EV_SETUP: dcd_event_setup_received(0, event->setup, false); break;
         case KEMU_USB_EV_XFER:
-            t.event_id = TU_EVT_XFER;
-            t.u.xfer.ep_addr = ev[i].ep_addr;
-            t.u.xfer.result = ev[i].ok ? 0U : 1U;
-            t.u.xfer.len = ev[i].len;
+            dcd_event_xfer_complete(0, event->ep_addr, event->len,
+                                    event->ok ? XFER_RESULT_SUCCESS : XFER_RESULT_FAILED, false);
             break;
         }
-        dcd_event_handler(&t, false);
     }
+#endif
 }
 
 #define WITH_MODEL(call) do { ensure(); xSemaphoreTake(s_lock, portMAX_DELAY); call; deliver(); } while (0)
@@ -188,9 +187,6 @@ esp_err_t __wrap_usb_new_phy(const void *conf, void **handle)
 esp_err_t __wrap_usb_del_phy(void *handle)
 {
     (void)handle;
-    /* An app that stops its USB (SD Reader after the computer ejected it) ends with tusb_deinit()
-     * and this. dcd_deinit() is TinyUSB's own weak function, called inside usbd.c, so the link
-     * cannot wrap it: the device leaves the bus here instead. */
     s_ints = false;
     WITH_MODEL(kemu_usb_dcd_deinit(&s_m));
     return ESP_OK;
@@ -198,7 +194,8 @@ esp_err_t __wrap_usb_del_phy(void *handle)
 
 /* ---- TinyUSB's device controller driver ---- */
 
-bool __wrap_dcd_init(uint8_t rhport, const void *rh_init)
+#ifdef KEMU_USB_TINYUSB
+bool __wrap_dcd_init(uint8_t rhport, const tusb_rhport_init_t *rh_init)
 {
     (void)rhport; (void)rh_init;
     bool ok = false;
@@ -211,7 +208,7 @@ bool __wrap_dcd_init(uint8_t rhport, const void *rh_init)
 bool __wrap_dcd_deinit(uint8_t rhport)
 {
     (void)rhport;
-    WITH_MODEL(kemu_usb_dcd_deinit(&s_m));
+    WITH_MODEL({ s_ints = false; kemu_usb_dcd_deinit(&s_m); });
     return true;
 }
 
@@ -230,7 +227,7 @@ void __wrap_dcd_int_disable(uint8_t rhport)
 }
 void __wrap_dcd_remote_wakeup(uint8_t rhport) { (void)rhport; }
 void __wrap_dcd_sof_enable(uint8_t rhport, bool en) { (void)rhport; (void)en; }
-void __wrap_dcd_edpt0_status_complete(uint8_t rhport, const void *request) { (void)rhport; (void)request; }
+void __wrap_dcd_edpt0_status_complete(uint8_t rhport, const tusb_control_request_t *request) { (void)rhport; (void)request; }
 
 void __wrap_dcd_set_address(uint8_t rhport, uint8_t dev_addr)
 {
@@ -250,11 +247,13 @@ void __wrap_dcd_disconnect(uint8_t rhport)
     WITH_MODEL(kemu_usb_dcd_disconnect(&s_m));
 }
 
-bool __wrap_dcd_edpt_open(uint8_t rhport, const tu_desc_ep_t *d)
+bool __wrap_dcd_edpt_open(uint8_t rhport, const tusb_desc_endpoint_t *d)
 {
     (void)rhport;
     bool ok = false;
-    WITH_MODEL(ok = kemu_usb_dcd_edpt_open(&s_m, d->bEndpointAddress, d->wMaxPacketSize & 0x7FFU, d->bmAttributes & 3U));
+    if (d == NULL) { return false; }
+    WITH_MODEL(ok = kemu_usb_dcd_edpt_open(&s_m, d->bEndpointAddress,
+        tu_edpt_packet_size(d), d->bmAttributes.xfer));
     return ok;
 }
 
@@ -266,7 +265,7 @@ bool __wrap_dcd_edpt_iso_alloc(uint8_t rhport, uint8_t ep_addr, uint16_t largest
     return ok;
 }
 
-bool __wrap_dcd_edpt_iso_activate(uint8_t rhport, const tu_desc_ep_t *d)
+bool __wrap_dcd_edpt_iso_activate(uint8_t rhport, const tusb_desc_endpoint_t *d)
 {
     return __wrap_dcd_edpt_open(rhport, d);
 }
@@ -283,17 +282,31 @@ void __wrap_dcd_edpt_close_all(uint8_t rhport)
     WITH_MODEL(kemu_usb_dcd_edpt_close_all(&s_m));
 }
 
-bool __wrap_dcd_edpt_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t *buffer, uint16_t total_bytes)
+bool __wrap_dcd_edpt_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t *buffer, uint16_t total_bytes
+#if TUSB_VERSION_NUMBER >= 2100
+    , bool is_isr
+#endif
+)
 {
     (void)rhport;
+#if TUSB_VERSION_NUMBER >= 2100
+    if (is_isr) { return false; }  /* The virtual controller uses task-context I/O. */
+#endif
     bool ok = false;
     WITH_MODEL(ok = kemu_usb_dcd_edpt_xfer(&s_m, ep_addr, buffer, total_bytes));
     return ok;
 }
 
-bool __wrap_dcd_edpt_xfer_fifo(uint8_t rhport, void *ff, uint16_t total_bytes)
+bool __wrap_dcd_edpt_xfer_fifo(uint8_t rhport, uint8_t ep_addr, tu_fifo_t *ff, uint16_t total_bytes
+#if TUSB_VERSION_NUMBER >= 2100
+    , bool is_isr
+#endif
+)
 {
-    (void)rhport; (void)ff; (void)total_bytes;
+    (void)rhport; (void)ep_addr; (void)ff; (void)total_bytes;
+#if TUSB_VERSION_NUMBER >= 2100
+    (void)is_isr;
+#endif
     return false;           /* the controller has no dedicated hardware FIFOs */
 }
 
@@ -308,3 +321,10 @@ void __wrap_dcd_edpt_clear_stall(uint8_t rhport, uint8_t ep_addr)
     (void)rhport;
     WITH_MODEL(kemu_usb_dcd_edpt_clear_stall(&s_m, ep_addr));
 }
+
+/* These calls in usbd.c resolve to its weak defaults unless we define them
+ * strongly. The linker only wraps references from outside that object. */
+bool dcd_deinit(uint8_t rhport) { return __wrap_dcd_deinit(rhport); }
+void dcd_connect(uint8_t rhport) { __wrap_dcd_connect(rhport); }
+void dcd_disconnect(uint8_t rhport) { __wrap_dcd_disconnect(rhport); }
+#endif
